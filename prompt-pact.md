@@ -417,6 +417,8 @@ For each service that **provides** an API consumed by others, write a Pact provi
 
 **Rule 5 — Verify results are published** by setting the system property `pact.verifier.publishResults=true` in the test or via Gradle.
 
+**Rule 6 — Use `@IgnoreNoPactsToVerify`** This allows the provider test to pass when no consumers have published contracts, while automatically verifying contracts once they are published. This is the recommended approach for new services or when setting up provider tests proactively.
+
 ### Provider test template:
 
 ```java
@@ -425,6 +427,7 @@ package com.example.productservice.contract;
 import au.com.dius.pact.provider.junit5.HttpTestTarget;
 import au.com.dius.pact.provider.junit5.PactVerificationContext;
 import au.com.dius.pact.provider.junit5.PactVerificationInvocationContextProvider;
+import au.com.dius.pact.provider.junitsupport.IgnoreNoPactsToVerify;
 import au.com.dius.pact.provider.junitsupport.Provider;
 import au.com.dius.pact.provider.junitsupport.State;
 import au.com.dius.pact.provider.junitsupport.loader.PactBroker;
@@ -444,6 +447,7 @@ import static org.mockito.Mockito.when;
     url = "http://localhost:9292",
     authentication = @PactBrokerAuth(username = "admin", password = "admin")
 )
+@IgnoreNoPactsToVerify  // Allow test to pass when no consumer pacts exist yet
 @ExtendWith(SpringExtension.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class ProductServiceProviderPactTest {
@@ -456,13 +460,19 @@ class ProductServiceProviderPactTest {
 
     @BeforeEach
     void setUp(PactVerificationContext context) {
-        context.setTarget(new HttpTestTarget("localhost", port));
+        // Context will be null when @IgnoreNoPactsToVerify creates a placeholder test
+        if (context != null) {
+            context.setTarget(new HttpTestTarget("localhost", port));
+        }
     }
 
     @TestTemplate
     @ExtendWith(PactVerificationInvocationContextProvider.class)
     void verifyPact(PactVerificationContext context) {
-        context.verifyInteraction();
+        // Context will be null when @IgnoreNoPactsToVerify creates a placeholder test
+        if (context != null) {
+            context.verifyInteraction();
+        }
     }
 
     // State string must be IDENTICAL to consumer's given() — character for character
