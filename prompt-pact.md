@@ -27,6 +27,12 @@ You are an expert Spring Boot and consumer-driven contract testing engineer. You
 - Empty pacts directories = provider tests pass (no contracts to verify)
 - **Important**: `build/` directories are typically in `.gitignore`, so pact files are regenerated on each test run rather than committed
 
+**Production Code Modification Policy (CRITICAL):**
+- **NEVER modify provider production code** (`src/main` in provider services) — Provider tests verify existing behavior as-is
+- **Avoid modifying consumer production code** (`src/main` in consumer services) — Only if absolutely necessary to fix genuine bugs
+- **Only modify**: Test code (`src/test/java/.../contract/`) and build configuration (`build.gradle`)
+- **Rationale**: Modifying providers creates cascading changes across all consumers; modifying consumers is isolated to one service
+
 ## THE SIX SERVICES
 
 The working directory contains six Spring Boot + Gradle microservices:
@@ -153,11 +159,13 @@ For each service that **provides** an API consumed by others, write a Pact provi
 
 **Rule 6 — Use `@IgnoreNoPactsToVerify`** This allows the provider test to pass when no consumers have published contracts, while automatically verifying contracts once they are published. This is the recommended approach and enables the incremental workflow.
 
-**Rule 7 — Ensure controllers return proper HTTP status codes for error cases.** Provider verification tests will fail if the actual HTTP response doesn't match the contract. Common issues:
-- When a resource is not found, return `ResponseEntity.notFound().build()` (404), not throw an uncaught exception
-- Catch service exceptions in controllers and map to appropriate HTTP status codes
-- Example: `catch (RuntimeException e) { return ResponseEntity.notFound().build(); }`
-- If Spring Security is enabled, verify that endpoints referenced in pacts are configured to `permitAll()` or the tests will receive 403 instead of the expected status
+**Rule 7 — DO NOT modify provider production code (src/main).** Provider tests must verify the provider's existing behavior exactly as-is. Use `@MockBean` and `@State` methods to set up test data that matches what the provider currently returns. If the provider returns certain HTTP status codes or error formats, the consumer contract must accept those behaviors, not the other way around.
+
+**Rule 8 — Modify consumer production code (src/main) ONLY if absolutely necessary.** If the consumer's actual HTTP client code doesn't match what you need to test:
+- First, try to work with the existing client code and write pact tests that match its actual behavior
+- Only modify consumer code if it's genuinely incorrect or incompatible with the provider
+- When changes are needed, prefer minimal adjustments (e.g., fixing serialization format, adding error handling)
+- Document why the change was necessary in code comments
 
 ### Provider test template with local file-based pacts:
 
@@ -277,6 +285,12 @@ For each service that calls another service, write a Pact consumer test.
 4. What error handling exists
 
 This prevents mismatches between the pact contract and actual implementation.
+
+**CRITICAL PRODUCTION CODE POLICY**:
+- Write pact tests that match the consumer's **existing client code behavior** exactly
+- Do NOT modify consumer production code (`src/main`) unless there's a genuine bug that prevents testing
+- If the existing client code has quirks (e.g., sends timestamps as arrays), write the pact to match that quirk
+- The pact test should document "what the consumer currently does," not "what we wish it did"
 
 ### Incremental consumer test workflow:
 
@@ -705,6 +719,198 @@ done
 - [ ] **Timestamp serialization is consistent**: Verify actual client code matches pact definition (string vs array format)
 - [ ] **Consumer tests pass locally**: All consumer pact tests run successfully (no `PactMismatchesException`)
 - [ ] **Provider returns expected status codes**: Provider tests should pass with 200/404/etc, not 400 (which indicates request format mismatch)
+- [ ] **NO provider src/main code modified**: Zero changes to provider controllers, services, or DTOs
+- [ ] **Minimal consumer src/main code changes**: Consumer client code changes only if absolutely necessary, with justification documented
+
+---
+
+## STEP 7 — MIGRATION TO PACT BROKER (OPTIONAL — AFTER ALL TESTS PASS LOCALLY)
+
+**ONLY perform this step after all provider and consumer tests are passing locally using the local file-based workflow.**
+
+Once all pact tests are green, you can migrate to publishing pacts to a web-based Pact Broker via GitHub Actions. This provides a centralized contract registry and enables cross-repo contract verification.
+
+### Why migrate to Pact Broker?
+- Central source of truth for all contracts across services
+- Contract versioning and history
+- Can-I-Deploy checks for safe deployments
+- Works across CI/CD pipelines without needing local pact files
+
+### Step 7.1 — Update Provider `build.gradle`
+
+For each **provider** service, replace the local file-based pact configuration with broker configuration:
+
+**Remove this:**
+```groovy
+pact {
+    serviceProviders {
+        '<service-name>' {
+            hasPactsWith('AllConsumers') {
+                pactFileLocation = resource('../*/build/pacts')
+            }
+        }
+    }
+}
+```
+
+**Add this:**
+```groovy
+pact {
+    serviceProviders {
+        '<service-name>' {  // Replace with actual service name matching spring.application.name
+            fromPactBroker {
+                selectors = latestTags('main')
+            }
+        }
+    }
+}
+```
+
+### Step 7.2 — Update Provider Test Class
+
+For each provider test class, replace `@PactFolder` with `@PactBroker`:
+
+**Remove this:**
+```java
+@Provider("product-service")
+@PactFolder("pacts")  // Remove this line
+@IgnoreNoPactsToVerify
+```
+
+**Add this:**
+```java
+@Provider("product-service")
+@PactBroker(url = "${pactbroker.url:http://localhost:9292}", authentication = @PactBrokerAuth(scheme = "bearer", token = "${pactbroker.auth.token}"))
+@IgnoreNoPactsToVerify
+```
+
+The `${pactbroker.url}` and `${pactbroker.auth.token}` placeholders will be populated from environment variables in CI/CD.
+
+### Step 7.3 — Create GitHub Actions Workflow
+
+For **each** service, create `.github/workflows/pact.yml`:
+
+```yaml
+name: Pact Contract Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  consumer-tests:
+    runs-on: ubuntu-latest
+    # Only run consumer tests if this service HAS consumers (i.e., makes HTTP calls to other services)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Run consumer contract tests
+        run: ./gradlew test --tests '*ConsumerPactTest'
+
+      - name: Publish pacts to broker
+        if: github.ref == 'refs/heads/main'  # Only publish from main branch
+        run: ./gradlew pactPublish
+        env:
+          PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+
+  provider-verification:
+    runs-on: ubuntu-latest
+    needs: consumer-tests  # Wait for consumer tests to publish pacts
+    # Only run provider tests if this service IS a provider (i.e., has REST endpoints called by others)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Run provider verification tests
+        run: ./gradlew test --tests '*ProviderPactTest'
+        env:
+          PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+          pactbroker.url: ${{ secrets.PACT_BROKER_BASE_URL }}
+          pactbroker.auth.token: ${{ secrets.PACT_BROKER_TOKEN }}
+
+      - name: Publish provider verification results
+        if: github.ref == 'refs/heads/main'
+        run: ./gradlew pactVerify -Ppact.verifier.publishResults=true -Ppact.provider.version=${{ github.sha }}
+        env:
+          PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
+          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+
+  can-i-deploy:
+    runs-on: ubuntu-latest
+    needs: provider-verification
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Check can-i-deploy
+        run: |
+          docker run --rm \
+            -e PACT_BROKER_BASE_URL=${{ secrets.PACT_BROKER_BASE_URL }} \
+            -e PACT_BROKER_TOKEN=${{ secrets.PACT_BROKER_TOKEN }} \
+            pactfoundation/pact-cli:latest \
+            broker can-i-deploy \
+            --pacticipant <SERVICE_NAME> \
+            --version ${{ github.sha }} \
+            --to-environment production
+```
+
+**Important notes:**
+- Replace `<SERVICE_NAME>` with the actual `spring.application.name` value
+- Consumer-only services (e.g., services that call others but provide no APIs) can skip the `provider-verification` job
+- Provider-only services (e.g., services that provide APIs but call no others) can skip the `consumer-tests` job
+
+### Step 7.4 — Add Pact Publish Configuration
+
+For **consumer** services, add the publish configuration to `build.gradle`:
+
+```groovy
+pact {
+    publish {
+        pactBrokerUrl = System.getenv('PACT_BROKER_BASE_URL') ?: 'http://localhost:9292'
+        pactBrokerToken = System.getenv('PACT_BROKER_TOKEN')
+        tags = ['main']
+        version = project.version ?: '1.0.0'
+    }
+}
+```
+
+### Step 7.5 — Configure GitHub Secrets
+
+In each repository's GitHub settings, add the following secrets:
+- `PACT_BROKER_BASE_URL` — The URL of your Pact Broker (e.g., `https://your-org.pactflow.io`)
+- `PACT_BROKER_TOKEN` — The authentication token for your Pact Broker
+
+### Step 7.6 — Verification
+
+After pushing to the `main` branch:
+
+1. **Check GitHub Actions** — All workflow steps should be green
+2. **Check Pact Broker UI** — Navigate to your broker URL and verify:
+   - All pact files are published with correct consumer/provider names
+   - All provider verifications show as PASSED
+   - The contract matrix shows all integrations as verified
+
+### Migration Checklist
+
+- [ ] All local provider and consumer tests passing with file-based pacts
+- [ ] Provider `build.gradle` updated to use `fromPactBroker` instead of `pactFileLocation`
+- [ ] Provider test classes updated to use `@PactBroker` annotation instead of `@PactFolder`
+- [ ] Consumer `build.gradle` updated with `pact { publish { ... } }` configuration
+- [ ] `.github/workflows/pact.yml` created for each service
+- [ ] GitHub secrets `PACT_BROKER_BASE_URL` and `PACT_BROKER_TOKEN` configured in all repos
+- [ ] Pushed to `main` branch and verified GitHub Actions workflows are green
+- [ ] Pact Broker UI shows all contracts published and verified
+
+**Note:** After migration to the Pact Broker, the local `build/pacts/` directories are no longer used in CI/CD. They will still be generated during local test runs for development purposes.
 
 ---
 
@@ -713,8 +919,10 @@ done
 1. **Write provider tests BEFORE consumer tests.** Establish green baseline with all provider tests passing (no pacts to verify) before writing any consumer tests.
 2. **Use local file-based pact loading.** All provider tests must use `@PactFolder("pacts")` annotation and Gradle configuration with `pactFileLocation = resource('../*/build/pacts')` glob pattern. Do NOT use `@PactBroker`.
 3. **Use incremental workflow.** After writing each consumer test, immediately run the consumer test to generate the pact file, then run the corresponding provider test to verify it. Fix any failures before moving to the next consumer test.
-4. **Minimal modification of production source files.** Add dependencies to `build.gradle` and Pact configuration blocks. Only modify controllers if necessary to return correct HTTP status codes that match the consumer contract (e.g., returning 404 instead of throwing exceptions). Do not modify business logic.
-5. **Provider `@Provider` value = `spring.application.name`** — read the yml file to get this value; do not invent it.
-6. **`given()` strings and `@State` strings must match exactly** — copy-paste from consumer to provider; do not rephrase.
-7. **Pact files in build/ directory.** Pact files are written to `build/pacts/` and regenerated on each test run. They do not need to be committed to git.
-8. **One branch for all changes: `feature/ai-naive-pact`** — create this branch before writing any code, one per repo.
+4. **NEVER modify provider production code (src/main).** Provider tests verify existing provider behavior as-is. Use test mocks and state handlers to match the provider's current implementation. Do NOT change controllers, services, or DTOs in the provider.
+5. **Avoid modifying consumer production code (src/main).** Only modify consumer client code if absolutely necessary (e.g., fixing actual bugs or incompatibilities). Prefer writing pact tests that match the consumer's existing behavior. Document any required changes with comments explaining why.
+6. **Only modify test code and build configuration.** Limit all changes to: `build.gradle` (dependencies and pact config), and new test files in `src/test/java/.../contract/`.
+7. **Provider `@Provider` value = `spring.application.name`** — read the yml file to get this value; do not invent it.
+8. **`given()` strings and `@State` strings must match exactly** — copy-paste from consumer to provider; do not rephrase.
+9. **Pact files in build/ directory.** Pact files are written to `build/pacts/` and regenerated on each test run. They do not need to be committed to git.
+10. **One branch for all changes: `feature/ai-naive-pact`** — create this branch before writing any code, one per repo.
