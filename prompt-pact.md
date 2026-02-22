@@ -91,9 +91,11 @@ Add the Pact publish configuration block (after the `dependencies {}` block):
         version = project.version ?: '1.0.0'
     }
     serviceProviders {
-        create(findProperty('spring.application.name') ?: project.name) {
+        '<service-name>' {  // Replace with actual service name, e.g., 'user-service'
             fromPactBroker {
-                selectors = latestTags('main')
+                withSelectors {
+                    tag 'main'
+                }
                 enablePending = false
                 providerTags = ['main']
             }
@@ -107,6 +109,14 @@ Add the Pact publish configuration block (after the `dependencies {}` block):
 ## STEP 3 — CONSUMER TESTS
 
 For each service that calls another service, write a Pact consumer test.
+
+**BEFORE WRITING PACTS**: Read the actual client code (e.g., `RestClient`, `WebClient`, `TelemetryClient`) to understand:
+1. What data format is actually being sent (especially timestamps)
+2. How objects are serialized (direct object vs `.toString()`)
+3. What headers are included
+4. What error handling exists
+
+This prevents mismatches between the pact contract and actual implementation.
 
 ### File location
 `src/test/java/{base_package}/contract/{ProviderName}ConsumerPactTest.java`
@@ -123,7 +133,10 @@ The base package is the same as the main application class package.
 
 **Rule 4 — Arrays use `minArrayLike` with at least one element.** Never assert exact array length. Use `body.minArrayLike(name, 1, matcher, exampleCount)` to state "there is at least one element of this structure."
 
-**Rule 5 — Timestamps and IDs use type matchers** rather than literal values, because the provider will generate different values at runtime. Use `body.stringType("timestamp")` for string timestamps or `body.minArrayLike("timestamp", 7, PactDslJsonRootValue.integerType(2024), 7)` for LocalDateTime arrays.
+**Rule 5 — Timestamps must match actual serialization format.** Before writing pact tests, verify how the actual client code serializes timestamps:
+- If sending `LocalDateTime.now().toString()` → Use `body.stringType("timestamp", "2024-01-15T10:30:45")` in pacts
+- If sending `LocalDateTime.now()` directly → Spring serializes to array `[year, month, day, hour, minute, second, nano]` → Use `body.minArrayLike("timestamp", 7, PactDslJsonRootValue.integerType(2024), 7)`
+- **CRITICAL**: The pact test MUST match what the actual production client code sends. Test failures with status 400 often indicate a timestamp format mismatch between the contract and actual client implementation.
 
 **Rule 6 — Test error responses too.** For any endpoint that can return 404 or 400, write a separate `@Pact` method for that error case with a different `given()` provider state.
 
@@ -286,15 +299,54 @@ class ProductServiceConsumerPactTest {
 
 ---
 
+### HANDLING TIMESTAMPS AND SERIALIZATION CONSISTENCY
+
+**CRITICAL DEBUGGING STEP**: Before writing any pact tests for endpoints that send timestamps, **verify the actual serialization format** by inspecting the client code.
+
+#### Common Timestamp Serialization Issues
+
+Provider tests returning **400 Bad Request** often indicate the consumer is sending data in a format the provider doesn't accept. The most common cause is timestamp serialization mismatch:
+
+**Issue**: Consumer pact defines timestamp as array `[2024, 1, 15, 10, 30, 45, 0]` but provider expects ISO-8601 string `"2024-01-15T10:30:45"`
+
+**Root cause**: The consumer client code sends `LocalDateTime.now()` directly in a Map/DTO. Spring's Jackson serializes `LocalDateTime` to an array by default when sent as a raw object, but the provider's DTO expects a string that Jackson deserializes from ISO-8601 format.
+
+**Solution**: Ensure consistency between client implementation and pact definition:
+
+1. **Option A - Send timestamps as strings (RECOMMENDED)**:
+   ```java
+   // In TelemetryClient or similar client code:
+   eventData.put("timestamp", LocalDateTime.now().toString());  // ✅ Sends ISO-8601 string
+
+   // In consumer pact test:
+   body.stringType("timestamp", "2024-01-15T10:30:45");  // ✅ Matches
+   ```
+
+2. **Option B - Accept array format** (only if provider truly accepts arrays):
+   ```java
+   // In client code:
+   eventData.put("timestamp", LocalDateTime.now());  // Serializes to array
+
+   // In consumer pact test:
+   body.minArrayLike("timestamp", 7, PactDslJsonRootValue.integerType(2024), 7);  // Matches
+   ```
+
+**Verification workflow**:
+1. Read the actual client code that makes HTTP calls (e.g., `TelemetryClient.java`)
+2. Check how timestamps are added to request bodies: `.put("timestamp", LocalDateTime.now())` vs `.put("timestamp", LocalDateTime.now().toString())`
+3. Write pact tests that match the actual format sent
+4. If tests fail with 400 errors, check if the format needs to change in the client code OR the pact definition
+
 ### HANDLING ARRAYS AND COMPLEX SERIALIZED TYPES
 
 When the provider serializes complex objects (like `LocalDateTime`, `ZonedDateTime`, or custom objects with Jackson serializers), they may appear as arrays or nested structures in JSON rather than simple strings.
 
 **Common cases:**
 
-1. **LocalDateTime** → Serialized as 7-element integer array: `[year, month, day, hour, minute, second, nanosecond]`
-2. **Arrays of objects** → Use `minArrayLike` to match structure without caring about exact count
-3. **Optional fields** → Use `optionalBody()` or conditional matchers
+1. **LocalDateTime sent as object** → Serialized as 7-element integer array: `[year, month, day, hour, minute, second, nanosecond]`
+2. **LocalDateTime sent as .toString()** → Serialized as ISO-8601 string: `"2024-01-15T10:30:45"`
+3. **Arrays of objects** → Use `minArrayLike` to match structure without caring about exact count
+4. **Optional fields** → Use `optionalBody()` or conditional matchers
 
 **Array matching patterns:**
 
@@ -418,6 +470,14 @@ For each service that **provides** an API consumed by others, write a Pact provi
 **Rule 5 — Verify results are published** by setting the system property `pact.verifier.publishResults=true` in the test or via Gradle.
 
 **Rule 6 — Use `@IgnoreNoPactsToVerify`** This allows the provider test to pass when no consumers have published contracts, while automatically verifying contracts once they are published. This is the recommended approach for new services or when setting up provider tests proactively.
+
+**Rule 7 — Ensure controllers return proper HTTP status codes for error cases.** Provider verification tests will fail if the actual HTTP response doesn't match the contract. Common issues:
+- When a resource is not found, return `ResponseEntity.notFound().build()` (404), not throw an uncaught exception
+- Catch service exceptions in controllers and map to appropriate HTTP status codes
+- Example: `catch (RuntimeException e) { return ResponseEntity.notFound().build(); }`
+- If Spring Security is enabled, verify that endpoints referenced in pacts are configured to `permitAll()` or the tests will receive 403 instead of the expected status
+
+**Rule 8 — Ensure consumer pacts are published with the latest version.** The `@PactBroker` annotation fetches the "latest" consumer version by default. If a newer consumer version exists but hasn't published pacts for your provider, the provider test won't find any pacts to verify. Always ensure consumer tests run and publish before provider verification.
 
 ### Provider test template:
 
@@ -585,11 +645,14 @@ curl -s http://admin:admin@localhost:9292/pacts | python3 -m json.tool
 
 - [ ] Every service that calls another service has at least one consumer pact test per endpoint called, plus at least one error case (404 or 400)
 - [ ] Every service that is called by others has a provider verification test with `@State` methods for every state referenced by all consumers
-- [ ] All pacts are published to the Pact Broker at `http://localhost:9292`
+- [ ] All pacts are published to the Pact Broker at `http://localhost:9292` - verify by checking http://localhost:9292/ shows recently published contracts
 - [ ] All provider verifications show PASSED in the Pact Broker UI
 - [ ] `spring.application.name` values match `@Provider` annotation values exactly — verify this programmatically by comparing the two files
 - [ ] No `@Pact` method uses `Math.random()`, `UUID.randomUUID()`, or any other source of randomness
 - [ ] No response body uses `.stringValue()` for fields where the specific string value is not contractually required
+- [ ] **Timestamp serialization is consistent**: Verify actual client code matches pact definition (string vs array format)
+- [ ] **Consumer tests pass locally**: All consumer pact tests run successfully before publishing (no `PactMismatchesException`)
+- [ ] **Provider returns expected status codes**: Provider tests should pass with 200/404/etc, not 400 (which indicates request format mismatch)
 - [ ] GitHub Actions workflows exist in every repository
 
 ---
@@ -597,7 +660,7 @@ curl -s http://admin:admin@localhost:9292/pacts | python3 -m json.tool
 ## CRITICAL CONSTRAINTS (violations will be called out in review)
 
 1. **Do not start a new service** or modify Docker Compose. The infrastructure is already running.
-2. **Do not modify any existing production source files.** Only add to `build.gradle`, `application.yml`, and test source directories.
+2. **Minimal modification of production source files.** Add dependencies to `build.gradle` and Pact configuration blocks. Only modify controllers if necessary to return correct HTTP status codes that match the consumer contract (e.g., returning 404 instead of throwing exceptions). Do not modify business logic.
 3. **Do not add the `@PactFolder` annotation** to provider tests — use `@PactBroker` to pull contracts from the running broker.
 4. **Provider `@Provider` value = `spring.application.name`** — read the yml file to get this value; do not invent it.
 5. **`given()` strings and `@State` strings must match exactly** — copy-paste from consumer to provider; do not rephrase.
