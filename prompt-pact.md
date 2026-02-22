@@ -536,7 +536,18 @@ When the provider serializes complex objects (like `LocalDateTime`, `ZonedDateTi
 **Array matching patterns:**
 
 ```java
-// For LocalDateTime or similar array-serialized types:
+// For LocalDateTime or similar array-serialized types (RECOMMENDED - uses type matching):
+body.array("timestamp", arr -> {
+    arr.numberType(2024);  // ✅ Type matcher - allows any year
+    arr.numberType(1);
+    arr.numberType(15);
+    arr.numberType(10);
+    arr.numberType(30);
+    arr.numberType(45);
+    arr.numberType(0);
+});
+
+// Alternative with minArrayLike (more complex, use only when minimum size matters):
 body.minArrayLike("timestamp", 7, PactDslJsonRootValue.integerType(2024), 7);
 // Parameters: fieldName, minSize, elementMatcher, exampleCount
 // exampleCount MUST be >= minSize, otherwise IllegalArgumentException
@@ -558,14 +569,41 @@ body.object("address", address -> {
 });
 ```
 
-**Critical**: When using `minArrayLike`, the fourth parameter (example count) must be `>= minSize`. If exampleCount is less than minSize, you'll get:
-```
-IllegalArgumentException: Number of example X is less than the minimum size of Y
-```
+**Critical array matcher rules:**
 
-Fix by setting exampleCount equal to or greater than minSize:
-- `minArrayLike("field", 7, matcher, 7)` ✅
-- `minArrayLike("field", 7, matcher, 0)` ❌
+1. **Use `.numberType()` not `.numberValue()` in array lambdas** — When using `body.array("field", arr -> {...})`, use `arr.numberType(example)` for type matching, not `arr.numberValue(exact)` which requires exact value matches:
+   - `arr.numberType(2024)` ✅ Matches any number
+   - `arr.numberValue(2024)` ❌ Only matches exactly 2024
+   - Same applies to `stringType` vs `stringValue`
+
+2. **When using `minArrayLike`, exampleCount must be >= minSize** — The fourth parameter (example count) must be `>= minSize`. If exampleCount is less than minSize, you'll get:
+   ```
+   IllegalArgumentException: Number of example X is less than the minimum size of Y
+   ```
+
+   Fix by setting exampleCount equal to or greater than minSize:
+   - `minArrayLike("field", 7, matcher, 7)` ✅
+   - `minArrayLike("field", 7, matcher, 0)` ❌
+
+**Recommended approach for LocalDateTime arrays:**
+
+Prefer `body.array()` with `numberType()` matchers over `minArrayLike()` for fixed-size arrays like timestamps:
+
+```java
+// ✅ RECOMMENDED - Simple and clear
+body.array("timestamp", arr -> {
+    arr.numberType(2024);
+    arr.numberType(1);
+    arr.numberType(15);
+    arr.numberType(10);
+    arr.numberType(30);
+    arr.numberType(45);
+    arr.numberType(0);
+});
+
+// ❌ NOT RECOMMENDED - More complex, easy to get wrong
+body.minArrayLike("timestamp", 7, PactDslJsonRootValue.integerType(2024), 7);
+```
 
 ---
 
