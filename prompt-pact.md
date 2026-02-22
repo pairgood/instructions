@@ -3,7 +3,29 @@
 
 ---
 
-You are an expert Spring Boot and consumer-driven contract testing engineer. You will implement comprehensive Pact contract tests across all six microservices in this working directory. This is an existing codebase — read before writing anything.
+You are an expert Spring Boot and consumer-driven contract testing engineer. You will implement comprehensive Pact contract tests across all six microservices in this working directory using a **provider-first, incremental workflow** with **local file-based pact storage**. This is an existing codebase — read before writing anything.
+
+## WORKFLOW OVERVIEW (CRITICAL — READ THIS FIRST)
+
+**Provider-First Approach:**
+1. **Write ALL provider tests first** — establish green baseline with no contracts to verify
+2. **Verify all provider tests pass** with `@IgnoreNoPactsToVerify` (no pact files exist yet)
+3. **Write consumer tests incrementally** — one interaction at a time
+4. **After each consumer test** — run it to generate pact file, then run provider test to verify
+5. **Fix any provider failures immediately** before moving to next consumer test
+
+**Why Provider-First?**
+- Green baseline from the start (all tests pass before any contracts exist)
+- Validates provider infrastructure early (Spring Boot context, mocks, state handlers)
+- Incremental feedback loop — each new contract is verified immediately
+- Prevents mass failures at the end
+
+**Local File-Based Storage:**
+- No Pact Broker required
+- Consumer tests write pact JSON files to `<consumer-service>/build/pacts/` (Gradle default)
+- Provider tests use glob pattern `../*/build/pacts` to scan sibling repos for pact files
+- Empty pacts directories = provider tests pass (no contracts to verify)
+- **Important**: `build/` directories are typically in `.gitignore`, so pact files are regenerated on each test run rather than committed
 
 ## THE SIX SERVICES
 
@@ -15,9 +37,10 @@ The working directory contains six Spring Boot + Gradle microservices:
 - `telemetry-service`
 - `user-service`
 
-## INFRASTRUCTURE (ALREADY RUNNING — DO NOT MODIFY)
+## INFRASTRUCTURE
 
-- **Pact Broker**: `http://localhost:9292` — credentials `admin` / `admin`
+- **Workspace Layout**: All six microservices are cloned to the same root directory (`/Users/davidkessler/refactor-working/`)
+- **Pact Storage**: Local file-based — pact JSON files stored in `<service>/build/pacts/` directories (Gradle default)
 - **Java**: 17+, **Spring Boot**: 3.x, **Build tool**: Gradle (Groovy DSL)
 - **Pact JVM version**: `au.com.dius.pact.consumer:junit5:4.6.x` (consumer) and `au.com.dius.pact.provider:junit5spring:4.6.x` (provider)
 
@@ -71,7 +94,7 @@ testImplementation 'au.com.dius.pact.provider:junit5spring:4.6.5'
 
 A service that both provides and consumes (which is likely) gets **both** dependencies.
 
-Also add the Pact Gradle plugin to `build.gradle` for every service that will publish pacts:
+Also add the Pact Gradle plugin to `build.gradle` for every service (both consumers and providers):
 
 ```groovy
 plugins {
@@ -80,33 +103,170 @@ plugins {
 }
 ```
 
-Add the Pact publish configuration block (after the `dependencies {}` block):
+For **provider** services, add the Pact configuration block to specify where to find pact files (after the `dependencies {}` block):
 
 ```groovy
-    publish {
-        pactBrokerUrl = 'http://localhost:9292'
-        pactBrokerUsername = 'admin'
-        pactBrokerPassword = 'admin'
-        tags = ['main']
-        version = project.version ?: '1.0.0'
-    }
+pact {
     serviceProviders {
-        '<service-name>' {  // Replace with actual service name, e.g., 'user-service'
-            fromPactBroker {
-                withSelectors {
-                    tag 'main'
-                }
-                enablePending = false
-                providerTags = ['main']
+        '<service-name>' {  // Replace with actual service name matching spring.application.name
+            // Use glob pattern to scan all sibling repos for pact files
+            hasPactsWith('AllConsumers') {
+                // This glob pattern looks for pacts in ../*/build/pacts relative to the provider repo
+                // Matches: ../order-service/build/pacts, ../payment-service/build/pacts, etc.
+                pactFileLocation = resource('../*/build/pacts')
             }
         }
     }
 }
 ```
 
+For **consumer** services, no additional Pact configuration is needed in `build.gradle`. Consumer tests automatically write pact files to the `build/pacts/` directory by default.
+
 ---
 
-## STEP 3 — CONSUMER TESTS
+## STEP 3 — PROVIDER TESTS (WRITE THESE FIRST)
+
+**CRITICAL: Write and verify provider tests BEFORE writing any consumer tests.**
+
+For each service that **provides** an API consumed by others, write a Pact provider verification test. With no consumer pacts published yet, these tests will pass trivially thanks to `@IgnoreNoPactsToVerify`.
+
+### Why provider-first?
+1. Establishes green baseline — all tests pass before any contracts exist
+2. Validates provider infrastructure works (Spring Boot, mock setup, state handlers)
+3. Prevents consumer-provider integration failures when contracts arrive
+4. Enables incremental workflow: each new consumer contract is immediately verified
+
+### File location
+`src/test/java/{base_package}/contract/{ServiceName}ProviderPactTest.java`
+
+### CRITICAL PROVIDER RULES
+
+**Rule 1 — Use local file-based pact loading with glob patterns.** Instead of `@PactBroker`, configure the provider to scan sibling repository directories for pact files. This works in a multi-repo workspace where all repos are cloned to the same root directory.
+
+**Rule 2 — The `@Provider` annotation value must exactly match `spring.application.name`** from `application.yml`. This is how pact files are matched to provider verifications.
+
+**Rule 3 — Use `@SpringBootTest` with `RANDOM_PORT`** so the full Spring context boots and the real controller logic is exercised.
+
+**Rule 4 — Use `@MockBean` to isolate the provider from downstream dependencies.** The provider test verifies the HTTP contract only — it must not fail because a database is unavailable or another service is down.
+
+**Rule 5 — Every `@State` method must configure mocks precisely.** The state string must be **identical** to the `given()` string in future consumer tests. Anticipate what states consumers will need based on your API's endpoints.
+
+**Rule 6 — Use `@IgnoreNoPactsToVerify`** This allows the provider test to pass when no consumers have published contracts, while automatically verifying contracts once they are published. This is the recommended approach and enables the incremental workflow.
+
+**Rule 7 — Ensure controllers return proper HTTP status codes for error cases.** Provider verification tests will fail if the actual HTTP response doesn't match the contract. Common issues:
+- When a resource is not found, return `ResponseEntity.notFound().build()` (404), not throw an uncaught exception
+- Catch service exceptions in controllers and map to appropriate HTTP status codes
+- Example: `catch (RuntimeException e) { return ResponseEntity.notFound().build(); }`
+- If Spring Security is enabled, verify that endpoints referenced in pacts are configured to `permitAll()` or the tests will receive 403 instead of the expected status
+
+### Provider test template with local file-based pacts:
+
+```java
+package com.example.productservice.contract;
+
+import au.com.dius.pact.provider.junit5.HttpTestTarget;
+import au.com.dius.pact.provider.junit5.PactVerificationContext;
+import au.com.dius.pact.provider.junit5.PactVerificationInvocationContextProvider;
+import au.com.dius.pact.provider.junitsupport.IgnoreNoPactsToVerify;
+import au.com.dius.pact.provider.junitsupport.Provider;
+import au.com.dius.pact.provider.junitsupport.State;
+import au.com.dius.pact.provider.junitsupport.loader.PactFolder;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.junit.jupiter.SpringExtension;
+
+import static org.mockito.Mockito.when;
+
+@Provider("product-service")   // MUST match spring.application.name exactly
+@PactFolder("pacts")  // Loads pacts from ../*/build/pacts directories via Gradle configuration
+@IgnoreNoPactsToVerify  // Allow test to pass when no consumer pacts exist yet
+@ExtendWith(SpringExtension.class)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class ProductServiceProviderPactTest {
+
+    @LocalServerPort
+    private int port;
+
+    @MockBean
+    private ProductRepository productRepository;  // mock all dependencies
+
+    @BeforeEach
+    void setUp(PactVerificationContext context) {
+        // Context will be null when @IgnoreNoPactsToVerify creates a placeholder test
+        if (context != null) {
+            context.setTarget(new HttpTestTarget("localhost", port));
+        }
+    }
+
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void verifyPact(PactVerificationContext context) {
+        // Context will be null when @IgnoreNoPactsToVerify creates a placeholder test
+        if (context != null) {
+            context.verifyInteraction();
+        }
+    }
+
+    // State strings should anticipate what consumers will need
+    @State("a product with id 42 exists")
+    void productWithId42Exists() {
+        when(productRepository.findById(42L))
+            .thenReturn(Optional.of(new Product(42L, "Widget", 9.99)));
+    }
+
+    @State("a product with id 999 does not exist")
+    void productWithId999DoesNotExist() {
+        when(productRepository.findById(999L))
+            .thenReturn(Optional.empty());
+    }
+
+    @State("no products exist")
+    void noProductsExist() {
+        when(productRepository.findAll())
+            .thenReturn(Collections.emptyList());
+    }
+}
+```
+
+### Gradle configuration for local file-based pacts:
+
+Add this to the `build.gradle` of each **provider** service:
+
+```groovy
+pact {
+    serviceProviders {
+        '<service-name>' {  // Replace with actual service name, e.g., 'product-service'
+            // Use glob pattern to scan all sibling repos for pact files
+            hasPactsWith('AllConsumers') {
+                // This glob pattern looks for pacts in ../*/build/pacts relative to the provider repo
+                // Matches: ../order-service/build/pacts, ../payment-service/build/pacts, etc.
+                pactFileLocation = resource('../*/build/pacts')
+            }
+        }
+    }
+}
+```
+
+This configuration tells the provider to scan all sibling directories for `build/pacts/` folders. Initially these folders don't exist or are empty, so provider tests pass. As consumer tests are written and generate pact files, the provider tests automatically pick them up.
+
+### Verify provider tests pass with no contracts:
+
+```bash
+cd product-service
+./gradlew test --tests '*ProviderPactTest'
+```
+
+**Expected result**: All provider tests should show GREEN/PASSED with message indicating no pacts to verify.
+
+---
+
+## STEP 4 — CONSUMER TESTS (WRITE THESE SECOND)
+
+**CRITICAL: Only start writing consumer tests AFTER all provider tests are green.**
 
 For each service that calls another service, write a Pact consumer test.
 
@@ -117,6 +277,17 @@ For each service that calls another service, write a Pact consumer test.
 4. What error handling exists
 
 This prevents mismatches between the pact contract and actual implementation.
+
+### Incremental consumer test workflow:
+
+1. **Write one consumer test** for a single interaction (one endpoint, one scenario)
+2. **Run the consumer test** — it generates a pact JSON file in `<consumer-service>/build/pacts/`
+3. **Verify the consumer test passes** — no `PactMismatchesException` errors
+4. **Run the provider test** — it should now pick up the new pact file and verify it
+5. **Fix any provider failures** — update provider state handlers or fix controller logic
+6. **Repeat** for each additional interaction
+
+This incremental approach ensures each contract is validated immediately rather than discovering all failures at the end.
 
 ### File location
 `src/test/java/{base_package}/contract/{ProviderName}ConsumerPactTest.java`
@@ -450,218 +621,100 @@ The issue occurs when:
 
 ---
 
-## STEP 4 — PROVIDER VERIFICATION TESTS
+## STEP 5 — VERIFICATION AND ITERATION
 
-For each service that **provides** an API consumed by others, write a Pact provider verification test.
+### Initial verification (all provider tests green):
 
-### File location
-`src/test/java/{base_package}/contract/{ServiceName}ProviderPactTest.java`
-
-### CRITICAL PROVIDER RULES
-
-**Rule 1 — The `@Provider` annotation value must exactly match `spring.application.name`** from `application.yml`. This is how the Pact Broker links consumer contracts to provider verifications. A mismatch means no verification runs.
-
-**Rule 2 — Use `@SpringBootTest` with `RANDOM_PORT`** so the full Spring context boots and the real controller logic is exercised.
-
-**Rule 3 — Use `@MockBean` to isolate the provider from downstream dependencies.** The provider test verifies the HTTP contract only — it must not fail because a database is unavailable or another service is down.
-
-**Rule 4 — Every `@State` method must configure mocks precisely.** The state string must be **identical** (character for character, including capitalisation and punctuation) to the `given()` string in the consumer test. Set up only what that state requires.
-
-**Rule 5 — Verify results are published** by setting the system property `pact.verifier.publishResults=true` in the test or via Gradle.
-
-**Rule 6 — Use `@IgnoreNoPactsToVerify`** This allows the provider test to pass when no consumers have published contracts, while automatically verifying contracts once they are published. This is the recommended approach for new services or when setting up provider tests proactively.
-
-**Rule 7 — Ensure controllers return proper HTTP status codes for error cases.** Provider verification tests will fail if the actual HTTP response doesn't match the contract. Common issues:
-- When a resource is not found, return `ResponseEntity.notFound().build()` (404), not throw an uncaught exception
-- Catch service exceptions in controllers and map to appropriate HTTP status codes
-- Example: `catch (RuntimeException e) { return ResponseEntity.notFound().build(); }`
-- If Spring Security is enabled, verify that endpoints referenced in pacts are configured to `permitAll()` or the tests will receive 403 instead of the expected status
-
-**Rule 8 — Ensure consumer pacts are published with the latest version.** The `@PactBroker` annotation fetches the "latest" consumer version by default. If a newer consumer version exists but hasn't published pacts for your provider, the provider test won't find any pacts to verify. Always ensure consumer tests run and publish before provider verification.
-
-### Provider test template:
-
-```java
-package com.example.productservice.contract;
-
-import au.com.dius.pact.provider.junit5.HttpTestTarget;
-import au.com.dius.pact.provider.junit5.PactVerificationContext;
-import au.com.dius.pact.provider.junit5.PactVerificationInvocationContextProvider;
-import au.com.dius.pact.provider.junitsupport.IgnoreNoPactsToVerify;
-import au.com.dius.pact.provider.junitsupport.Provider;
-import au.com.dius.pact.provider.junitsupport.State;
-import au.com.dius.pact.provider.junitsupport.loader.PactBroker;
-import au.com.dius.pact.provider.junitsupport.loader.PactBrokerAuth;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.TestTemplate;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
-import org.springframework.boot.test.web.server.LocalServerPort;
-import org.springframework.test.context.junit.jupiter.SpringExtension;
-
-import static org.mockito.Mockito.when;
-
-@Provider("product-service")   // MUST match spring.application.name exactly
-@PactBroker(
-    url = "http://localhost:9292",
-    authentication = @PactBrokerAuth(username = "admin", password = "admin")
-)
-@IgnoreNoPactsToVerify  // Allow test to pass when no consumer pacts exist yet
-@ExtendWith(SpringExtension.class)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-class ProductServiceProviderPactTest {
-
-    @LocalServerPort
-    private int port;
-
-    @MockBean
-    private ProductRepository productRepository;  // mock all dependencies
-
-    @BeforeEach
-    void setUp(PactVerificationContext context) {
-        // Context will be null when @IgnoreNoPactsToVerify creates a placeholder test
-        if (context != null) {
-            context.setTarget(new HttpTestTarget("localhost", port));
-        }
-    }
-
-    @TestTemplate
-    @ExtendWith(PactVerificationInvocationContextProvider.class)
-    void verifyPact(PactVerificationContext context) {
-        // Context will be null when @IgnoreNoPactsToVerify creates a placeholder test
-        if (context != null) {
-            context.verifyInteraction();
-        }
-    }
-
-    // State string must be IDENTICAL to consumer's given() — character for character
-    @State("a product with id 42 exists")
-    void productWithId42Exists() {
-        when(productRepository.findById(42L))
-            .thenReturn(Optional.of(new Product(42L, "Widget", 9.99)));
-    }
-
-    @State("a product with id 999 does not exist")
-    void productWithId999DoesNotExist() {
-        when(productRepository.findById(999L))
-            .thenReturn(Optional.empty());
-    }
-
-    @State("no products exist")
-    void noProductsExist() {
-        when(productRepository.findAll())
-            .thenReturn(Collections.emptyList());
-    }
-}
-```
-
----
-
-## STEP 5 — GITHUB ACTIONS CI/CD WORKFLOW
-
-For **each** service, create or update `.github/workflows/pact.yml`. The workflow must:
-
-1. Run consumer tests and publish pacts to the broker on every push to `main`
-2. Run provider verification tests and publish results to the broker
-3. Gate deployments with `can-i-deploy` check
-
-```yaml
-name: Pact Contract Tests
-
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-jobs:
-  consumer-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-      - name: Run consumer contract tests and publish pacts
-        run: ./gradlew test pactPublish
-        env:
-          PACT_BROKER_BASE_URL: ${{ vars.PACT_BROKER_BASE_URL }}
-          PACT_BROKER_USERNAME: ${{ secrets.PACT_BROKER_USERNAME }}
-          PACT_BROKER_PASSWORD: ${{ secrets.PACT_BROKER_PASSWORD }}
-
-  provider-verification:
-    runs-on: ubuntu-latest
-    needs: consumer-tests
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-      - name: Run provider verification and publish results
-        run: ./gradlew test -Dpact.verifier.publishResults=true -Dpact.provider.version=${{ github.sha }}
-        env:
-          PACT_BROKER_BASE_URL: ${{ vars.PACT_BROKER_BASE_URL }}
-          PACT_BROKER_USERNAME: ${{ secrets.PACT_BROKER_USERNAME }}
-          PACT_BROKER_PASSWORD: ${{ secrets.PACT_BROKER_PASSWORD }}
-
-  can-i-deploy:
-    runs-on: ubuntu-latest
-    needs: provider-verification
-    steps:
-      - name: Check can-i-deploy
-        run: |
-          docker run --rm pactfoundation/pact-cli:latest \
-            broker can-i-deploy \
-            --pacticipant <SERVICE_NAME> \
-            --version ${{ github.sha }} \
-            --to-environment production \
-            --broker-base-url ${{ vars.PACT_BROKER_BASE_URL }} \
-            --broker-username ${{ secrets.PACT_BROKER_USERNAME }} \
-            --broker-password ${{ secrets.PACT_BROKER_PASSWORD }}
-```
-
----
-
-## STEP 6 — VERIFICATION
-
-After writing all tests, verify by running:
+After writing all provider tests but before writing any consumer tests:
 
 ```bash
-# For each service:
-cd <service-name>
-./gradlew test pactPublish
-
-# Then verify providers:
-./gradlew test -Dpact.verifier.publishResults=true
-
-# Check broker shows all contracts and verifications:
-curl -s http://admin:admin@localhost:9292/pacts | python3 -m json.tool
+# For each service that provides APIs:
+cd <provider-service>
+./gradlew test --tests '*ProviderPactTest'
 ```
 
-### Definition of Done
+**Expected result**: All provider tests should be GREEN with messages indicating no pacts to verify.
 
+### Incremental verification workflow:
+
+For each consumer interaction you implement:
+
+```bash
+# 1. Write one consumer test
+# 2. Run the consumer test to generate pact file
+cd <consumer-service>
+./gradlew test --tests '*ConsumerPactTest'
+
+# 3. Verify pact file was created
+ls build/pacts/  # Should show: <ConsumerName>-<ProviderName>.json
+
+# 4. Run the provider test to verify the new contract
+cd ../<provider-service>
+./gradlew test --tests '*ProviderPactTest'
+
+# 5. If provider test fails:
+#    - Check state handler matches consumer's given() string exactly
+#    - Verify controller returns expected status codes
+#    - Check mock setup matches expected data
+#    - Fix and re-run until green
+
+# 6. Repeat for next consumer interaction
+```
+
+### Final verification (all tests pass):
+
+After implementing all consumer tests:
+
+```bash
+# Run all consumer tests across all services
+for service in notification-service order-service payment-service product-service telemetry-service user-service; do
+  echo "Running consumer tests for $service..."
+  cd $service
+  ./gradlew test --tests '*ConsumerPactTest' || echo "FAILED: $service consumer tests"
+  cd ..
+done
+
+# Run all provider tests across all services
+for service in notification-service order-service payment-service product-service telemetry-service user-service; do
+  echo "Running provider tests for $service..."
+  cd $service
+  ./gradlew test --tests '*ProviderPactTest' || echo "FAILED: $service provider tests"
+  cd ..
+done
+```
+
+**Expected result**: All consumer tests generate pact files. All provider tests verify their respective pact files and show PASSED.
+
+---
+
+## STEP 6 — DEFINITION OF DONE
+
+- [ ] **Provider tests written first**: All provider tests exist and pass with no contracts (green baseline)
+- [ ] **Provider tests use local file-based loading**: All provider tests use `@PactFolder("pacts")` and Gradle `pactFileLocation = resource('../*/build/pacts')` configuration
+- [ ] **Provider tests use `@IgnoreNoPactsToVerify`**: Provider tests pass when no pact files exist
+- [ ] **Consumer tests written second**: Consumer tests only written after provider tests are green
+- [ ] **Incremental verification**: After each consumer test is written, the corresponding provider test is run to verify the new contract
 - [ ] Every service that calls another service has at least one consumer pact test per endpoint called, plus at least one error case (404 or 400)
 - [ ] Every service that is called by others has a provider verification test with `@State` methods for every state referenced by all consumers
-- [ ] All pacts are published to the Pact Broker at `http://localhost:9292` - verify by checking http://localhost:9292/ shows recently published contracts
-- [ ] All provider verifications show PASSED in the Pact Broker UI
+- [ ] **Pact files in build/pacts/**: Pact JSON files are generated in `<service>/build/pacts/` directories (regenerated on each consumer test run)
+- [ ] **All consumer tests pass**: Run `./gradlew test --tests '*ConsumerPactTest'` in each consumer service — all GREEN
+- [ ] **All provider tests pass**: Run `./gradlew test --tests '*ProviderPactTest'` in each provider service — all GREEN
 - [ ] `spring.application.name` values match `@Provider` annotation values exactly — verify this programmatically by comparing the two files
 - [ ] No `@Pact` method uses `Math.random()`, `UUID.randomUUID()`, or any other source of randomness
 - [ ] No response body uses `.stringValue()` for fields where the specific string value is not contractually required
 - [ ] **Timestamp serialization is consistent**: Verify actual client code matches pact definition (string vs array format)
-- [ ] **Consumer tests pass locally**: All consumer pact tests run successfully before publishing (no `PactMismatchesException`)
+- [ ] **Consumer tests pass locally**: All consumer pact tests run successfully (no `PactMismatchesException`)
 - [ ] **Provider returns expected status codes**: Provider tests should pass with 200/404/etc, not 400 (which indicates request format mismatch)
-- [ ] GitHub Actions workflows exist in every repository
 
 ---
 
 ## CRITICAL CONSTRAINTS (violations will be called out in review)
 
-1. **Do not start a new service** or modify Docker Compose. The infrastructure is already running.
-2. **Minimal modification of production source files.** Add dependencies to `build.gradle` and Pact configuration blocks. Only modify controllers if necessary to return correct HTTP status codes that match the consumer contract (e.g., returning 404 instead of throwing exceptions). Do not modify business logic.
-3. **Do not add the `@PactFolder` annotation** to provider tests — use `@PactBroker` to pull contracts from the running broker.
-4. **Provider `@Provider` value = `spring.application.name`** — read the yml file to get this value; do not invent it.
-5. **`given()` strings and `@State` strings must match exactly** — copy-paste from consumer to provider; do not rephrase.
-6. **One branch for all changes: `feature/ai-naive-pact`** — create this branch before writing any code, one per repo.
+1. **Write provider tests BEFORE consumer tests.** Establish green baseline with all provider tests passing (no pacts to verify) before writing any consumer tests.
+2. **Use local file-based pact loading.** All provider tests must use `@PactFolder("pacts")` annotation and Gradle configuration with `pactFileLocation = resource('../*/build/pacts')` glob pattern. Do NOT use `@PactBroker`.
+3. **Use incremental workflow.** After writing each consumer test, immediately run the consumer test to generate the pact file, then run the corresponding provider test to verify it. Fix any failures before moving to the next consumer test.
+4. **Minimal modification of production source files.** Add dependencies to `build.gradle` and Pact configuration blocks. Only modify controllers if necessary to return correct HTTP status codes that match the consumer contract (e.g., returning 404 instead of throwing exceptions). Do not modify business logic.
+5. **Provider `@Provider` value = `spring.application.name`** — read the yml file to get this value; do not invent it.
+6. **`given()` strings and `@State` strings must match exactly** — copy-paste from consumer to provider; do not rephrase.
+7. **Pact files in build/ directory.** Pact files are written to `build/pacts/` and regenerated on each test run. They do not need to be committed to git.
+8. **One branch for all changes: `feature/ai-naive-pact`** — create this branch before writing any code, one per repo.
