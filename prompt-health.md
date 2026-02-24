@@ -822,6 +822,134 @@ curl -s http://localhost:<port>/actuator/health | python3 -m json.tool
 # and correct behaviour — it does not indicate a bug in the health indicator.
 ```
 
+### 8b — Automated status and component validation
+
+After all seven services are started, run the following script to confirm every service reports overall status `UP` and exposes the expected health check components.
+
+**Before running:** replace each `<PORT>` with the `server.port` value you recorded in Step 1.
+
+```bash
+#!/usr/bin/env bash
+# validate-health.sh — run from the working directory root after all services are started
+
+# ── Port map: fill in the actual ports discovered in Step 1 ──────────────────
+declare -A PORT_MAP=(
+  [notification-service]=<PORT>
+  [order-service]=<PORT>
+  [payment-service]=<PORT>
+  [product-service]=<PORT>
+  [telemetry-service]=<PORT>
+  [user-service]=<PORT>
+)
+
+# ── Expected component map: fill in based on Step 1 discovery ────────────────
+# Format: "comp1 comp2 comp3"
+# Every service gets diskSpace + ping + livenessState + readinessState as a baseline.
+# Add "db" for services with a DataSource.
+# Add the camelCase indicator ID for every custom HealthIndicator (e.g. "userService").
+declare -A EXPECTED_COMPONENTS=(
+  [notification-service]="diskSpace ping livenessState readinessState"
+  [order-service]="diskSpace ping livenessState readinessState"
+  [payment-service]="diskSpace ping livenessState readinessState"
+  [product-service]="diskSpace ping livenessState readinessState"
+  [telemetry-service]="diskSpace ping livenessState readinessState"
+  [user-service]="diskSpace ping livenessState readinessState"
+)
+# Example after filling in for a service that has a DB and calls two downstream services:
+#   [order-service]="diskSpace ping livenessState readinessState db productService userService"
+
+FAILED=0
+
+for svc in notification-service order-service payment-service product-service telemetry-service user-service; do
+  PORT=${PORT_MAP[$svc]}
+  echo "──────────────────────────────────────────"
+  echo "Checking $svc on port $PORT"
+
+  RESPONSE=$(curl -s --max-time 5 "http://localhost:$PORT/actuator/health" 2>/dev/null)
+
+  if [ -z "$RESPONSE" ]; then
+    echo "  FAIL — no response (is the service running?)"
+    FAILED=1
+    continue
+  fi
+
+  # Overall status must be UP
+  OVERALL=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','MISSING'))" 2>/dev/null)
+  if [ "$OVERALL" != "UP" ]; then
+    echo "  FAIL — overall status is '$OVERALL' (expected UP)"
+    echo "$RESPONSE" | python3 -m json.tool 2>/dev/null
+    FAILED=1
+  else
+    echo "  OK   — overall status: UP"
+  fi
+
+  # Retrieve component names and statuses
+  COMP_JSON=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+comps = d.get('components', {})
+for name, val in sorted(comps.items()):
+    print(name, val.get('status', 'UNKNOWN'))
+" 2>/dev/null)
+
+  COMP_COUNT=$(echo "$COMP_JSON" | wc -l | tr -d ' ')
+  echo "  Components found ($COMP_COUNT):"
+  while IFS= read -r line; do
+    COMP_NAME=$(echo "$line" | awk '{print $1}')
+    COMP_STATUS=$(echo "$line" | awk '{print $2}')
+    if [ "$COMP_STATUS" = "UP" ]; then
+      echo "    ✓ $COMP_NAME: $COMP_STATUS"
+    else
+      echo "    ✗ $COMP_NAME: $COMP_STATUS  ← DEGRADED"
+      FAILED=1
+    fi
+  done <<< "$COMP_JSON"
+
+  # Verify every expected component is present
+  for comp in ${EXPECTED_COMPONENTS[$svc]}; do
+    FOUND=$(echo "$COMP_JSON" | awk '{print $1}' | grep -c "^${comp}$" || true)
+    if [ "$FOUND" -eq 0 ]; then
+      echo "  FAIL — expected component '$comp' is missing from /actuator/health response"
+      FAILED=1
+    fi
+  done
+done
+
+echo "══════════════════════════════════════════"
+if [ $FAILED -eq 0 ]; then
+  echo "PASSED — all services UP with expected components."
+else
+  echo "FAILED — see errors above. Common fixes:"
+  echo "  • 'MISSING' component  → HealthIndicator class not annotated @Component, or indicator ID in health group is wrong"
+  echo "  • Component status DOWN → check 'error' field in the component details for 403 / 404 / connection-refused"
+  echo "  • No response          → service is not running"
+  exit 1
+fi
+```
+
+**What this script checks:**
+
+| Check | Pass condition |
+|---|---|
+| Overall status | `"status": "UP"` for every service |
+| Component presence | Every component listed in `EXPECTED_COMPONENTS` exists in the response |
+| Component status | Every component reports `UP` (degraded components are flagged) |
+| Component count | Printed for visual inspection — use to catch unexpectedly missing indicators |
+
+**Fill in `EXPECTED_COMPONENTS` correctly.** Use the Health Readiness Map from Step 1 to determine which entries belong in each service:
+
+| Indicator | When to include |
+|---|---|
+| `db` | Service has a `DataSource` (JPA, JDBC, H2, PostgreSQL, etc.) |
+| `diskSpace` | Always — built in |
+| `ping` | Always — built in |
+| `livenessState` | Always — enabled in Step 3 |
+| `readinessState` | Always — enabled in Step 3 |
+| `userService` | Service has a `UserServiceHealthIndicator` (class name → strip `HealthIndicator`, lowercase first letter) |
+| `productService` | Service has a `ProductServiceHealthIndicator` |
+| `notificationService` | Service has a `NotificationServiceHealthIndicator` |
+| *(etc.)* | One entry per custom `HealthIndicator` class |
+
 ---
 
 ## DEFINITION OF DONE
@@ -844,6 +972,11 @@ curl -s http://localhost:<port>/actuator/health | python3 -m json.tool
 - [ ] Health groups separate `liveness` (diskSpace only) from `readiness` (db + downstream)
 - [ ] `./gradlew build` passes for all six services
 - [ ] Unit tests exist for every custom `HealthIndicator`
+- [ ] `GET /actuator/health` returns `{"status":"UP"}` for every service when all dependencies are running
+- [ ] Every service exposes at minimum: `diskSpace`, `ping`, `livenessState`, `readinessState` components
+- [ ] Services with a `DataSource` include a `db` component in the health response
+- [ ] Services with custom `HealthIndicator` classes include the corresponding camelCase component ID in the health response
+- [ ] The `validate-health.sh` script from Step 8b exits 0 (all services UP, all expected components present)
 
 **For admin-service:**
 - [ ] `admin-service/` directory exists in the working directory root

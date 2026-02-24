@@ -2,4 +2,4 @@ date,refactoring,approach,description,duration_mins,context_compactions,notes
 2006-2-21, pact, manual, DEPENDENCY ADDITIONS, 12, 0, Researched if providers with no pacts still pass
 2006-2-21, pact, manual, CONSUMER TESTS, 145, 0, 
 2006-2-22, pact, manual, PROVIDER TESTS,90, 0, 
-
+2006-2-23, pact, manual, HEALTH ENDPOINTS,53, 0, 
