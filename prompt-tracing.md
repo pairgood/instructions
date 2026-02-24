@@ -30,7 +30,7 @@ For **each** of the six services, read and record:
 1. The full `build.gradle` — note existing dependencies, Spring Boot version (determines which Micrometer tracing BOM to use), and any existing observability-related dependencies
 2. Every `src/main/resources/application.yml` and `application-*.yml` — record `spring.application.name`, `server.port`, and any existing `management.*` or `logging.*` configuration
 3. Every `@RestController` — list each endpoint path and HTTP method
-4. Every class that calls another service via `RestTemplate`, `WebClient`, `FeignClient`, or `RestClient` — these require trace context propagation configuration
+4. Every class that calls another service via `RestTemplate`, `WebClient`, `FeignClient`, or `RestClient` — these require trace context propagation configuration. For each such class, record **how** the client is constructed. Specifically, search for `WebClient.builder().build()` or `WebClient.create()` — direct construction bypasses OTel instrumentation and must be fixed in Step 4.
 5. Any existing `@Async` methods, `ThreadPoolTaskExecutor` beans, or `CompletableFuture` usage — async calls require explicit MDC context propagation
 6. Any existing logging configuration files (`logback-spring.xml`, `logback.xml`, `log4j2.xml`)
 
@@ -171,6 +171,34 @@ public WebClient webClient(WebClient.Builder builder) {
 }
 ```
 
+**CRITICAL — Fix all existing `@Service` and `@Component` classes too:**
+
+Creating the `@Bean` above is not sufficient on its own. Any existing `@Service` or `@Component` class that constructs `WebClient` directly in a no-arg constructor will bypass the instrumented builder entirely, breaking trace propagation for that client.
+
+Search for this pattern across all service source files:
+```bash
+grep -rn "WebClient.builder().build()\|WebClient.create()" src/main/java/
+```
+
+For every match found **outside of test constructors**, change the constructor to inject `WebClient.Builder`:
+
+```java
+// BEFORE — bypasses OTel instrumentation:
+public MyServiceClient() {
+    this.webClient = WebClient.builder().build();
+}
+
+// AFTER — uses Spring Boot's auto-configured, OTel-instrumented builder:
+import org.springframework.web.reactive.function.client.WebClient.Builder;
+
+@Autowired
+public MyServiceClient(Builder builder) {
+    this.webClient = builder.build();
+}
+```
+
+It is acceptable to leave test-only constructors (e.g., `MyServiceClient(String baseUrl)`) using `WebClient.builder().build()` — those are not managed by Spring and do not affect production trace propagation.
+
 ### For services with @Async methods (if any found in Step 1):
 
 ```java
@@ -292,6 +320,7 @@ done
 - [ ] All six `application.yml` files have the log pattern including `[%X{traceId:-},%X{spanId:-}]`
 - [ ] All six `build.gradle` files contain `micrometer-tracing-bridge-otel` and `opentelemetry-exporter-otlp`
 - [ ] Every service that makes outbound HTTP calls has a `@Bean` RestTemplate or WebClient wired with `ObservationRegistry`
+- [ ] No `@Service` or `@Component` class constructs `WebClient` directly via `WebClient.builder().build()` or `WebClient.create()` — all production constructors inject `WebClient.Builder`
 - [ ] `./gradlew build` passes for all six services
 - [ ] Jaeger UI at `http://localhost:16686` shows traces from all six services after a request flow
 - [ ] A single trace in Jaeger shows connected spans from all services that participate in a given call chain
@@ -308,4 +337,5 @@ done
 4. **Do not modify any existing production logic.** Only add configuration, dependencies, and the `TracingConfig.java` class.
 5. **Do not add a `logback-spring.xml`** if one does not already exist — use `logging.pattern.console` in `application.yml` instead.
 6. **Use `RestTemplateBuilder.observationRegistry()`** for RestTemplate, not manual interceptor wiring. Manual `ClientHttpRequestInterceptor` approaches do not propagate W3C `traceparent` headers correctly with Micrometer Tracing.
+7. **Never call `WebClient.builder().build()` in a Spring-managed class.** Creating a `TracingConfig @Bean` is not enough — any `@Service` or `@Component` that constructs its own `WebClient` directly will silently break cross-service trace propagation. Every such class must use an `@Autowired` constructor that accepts `WebClient.Builder`. The builder Spring injects is already instrumented with OTel; the one from `WebClient.builder()` is not.
 7. **One branch for all changes: `feature/ai-naive-tracing`** — create this branch before writing any code, one per repo.
