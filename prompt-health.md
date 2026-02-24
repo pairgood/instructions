@@ -1,4 +1,4 @@
-# NAIVE PROMPT — HEALTH ENDPOINTS + SPRING BOOT ADMIN
+# PROMPT — HEALTH ENDPOINTS + SPRING BOOT ADMIN
 ## For use against: notification-service, order-service, payment-service, product-service, telemetry-service, user-service + new admin-service
 
 ---
@@ -38,7 +38,7 @@ Before reading any file or writing any code, create the working branch in every 
 # Run from the working directory root — one command per repo
 for svc in notification-service order-service payment-service product-service telemetry-service user-service; do
     cd $svc
-    git checkout -b feature/ai-naive-health
+    git checkout -b ai-single-prompt-health
     cd ..
 done
 ```
@@ -50,10 +50,10 @@ for svc in notification-service order-service payment-service product-service te
     echo -n "$svc: "
     cd $svc && git branch --show-current && cd ..
 done
-# Expected output: feature/ai-naive-health for every service
+# Expected output: ai-single-prompt-health for every service
 ```
 
-The `admin-service` branch is created after the directory is initialised in Step 5. All code written from Step 1 onwards goes onto `feature/ai-naive-health`. Never commit to `main`.
+The `admin-service` branch is created after the directory is initialised in Step 5. All code written from Step 1 onwards goes onto `ai-single-prompt-health`. Never commit to `main`.
 
 ---
 
@@ -472,11 +472,11 @@ After creating the directory and copying the Gradle wrapper files, initialise gi
 ```bash
 cd admin-service
 git init
-git checkout -b feature/ai-naive-health
+git checkout -b ai-single-prompt-health
 cd ..
 ```
 
-All subsequent files written to `admin-service` are committed on `feature/ai-naive-health`, not `main`.
+All subsequent files written to `admin-service` are committed on `ai-single-prompt-health`, not `main`.
 
 ### `build.gradle` for admin-service:
 
@@ -1000,7 +1000,7 @@ fi
 5. **Never throw an uncaught exception from a `HealthIndicator`** — always return `Health.down().withDetail("error", message).build()` instead.
 6. **The `admin-service` port must be `8099`** — this must match the client URL configured in all six services. Verify this is not already taken by any of the six services before finalising.
 7. **Do not use `management.endpoints.web.exposure.include: "*"`** in the six services — wildcard exposure is a security risk. Expose only `health,info,metrics,loggers`.
-8. **All changes go on `feature/ai-naive-health`** — this branch is created in Step 0 for the six existing repos, and after `git init` for `admin-service` in Step 5. Never commit to `main` in any repo. Verify the active branch before making any commit with `git branch --show-current`.
+8. **All changes go on `ai-single-prompt-health`** — this branch is created in Step 0 for the six existing repos, and after `git init` for `admin-service` in Step 5. Never commit to `main` in any repo. Verify the active branch before making any commit with `git branch --show-current`.
 9. **Check the actual `server.port` of each service from its `application.yml`** before writing downstream health indicator URLs — do not invent port numbers or assume defaults.
 10. **If a service has Spring Security, `/actuator/**` must be explicitly permitted** — add `.requestMatchers("/actuator/**").permitAll()` to the existing `SecurityFilterChain` bean. Without this, all downstream health indicators that call this service will receive 403 and report DOWN, even when the service is fully healthy. See Step 4f.
 11. **The `git-commit-id` plugin requires a `.git` directory** — each repo must be a git repository (which they are, since Step 0 checks out a branch). The plugin will fail with `dotGitDirectory does not exist` if run outside a git repo. Do not run `./gradlew build` from a path that does not have a `.git` ancestor.

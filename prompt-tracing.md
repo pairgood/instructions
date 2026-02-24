@@ -1,4 +1,4 @@
-# NAIVE PROMPT — DISTRIBUTED TRACING (Jaeger + OpenTelemetry)
+# PROMPT — DISTRIBUTED TRACING (Jaeger + OpenTelemetry)
 ## For use against: notification-service, order-service, payment-service, product-service, telemetry-service, user-service
 
 ---
@@ -20,6 +20,33 @@ The working directory contains six Spring Boot + Gradle microservices:
 - **Jaeger all-in-one**: `http://localhost:16686` (UI), OTLP gRPC endpoint: `http://localhost:4317`, OTLP HTTP endpoint: `http://localhost:4318`
 - **Java**: 17+, **Spring Boot**: 3.x, **Build tool**: Gradle (Groovy DSL)
 - **Tracing approach**: Micrometer Tracing Bridge OTel + OpenTelemetry Java SDK, exporting via OTLP to Jaeger
+
+---
+
+## STEP 0 — CREATE BRANCHES (DO THIS FIRST, BEFORE ANY OTHER ACTION)
+
+Before reading any file or writing any code, create the working branch in every existing repo:
+
+```bash
+# Run from the working directory root — one command per repo
+for svc in notification-service order-service payment-service product-service telemetry-service user-service; do
+    cd $svc
+    git checkout -b ai-single-prompt-tracing
+    cd ..
+done
+```
+
+Verify all six branches exist before continuing:
+
+```bash
+for svc in notification-service order-service payment-service product-service telemetry-service user-service; do
+    echo -n "$svc: "
+    cd $svc && git branch --show-current && cd ..
+done
+# Expected output: ai-single-prompt-tracing for every service
+```
+
+All code written from Step 1 onwards goes onto `ai-single-prompt-tracing`. Never commit to `main`.
 
 ---
 
@@ -404,4 +431,4 @@ done
 5. **Do not add a `logback-spring.xml`** if one does not already exist — use `logging.pattern.console` in `application.yml` instead.
 6. **Use `RestTemplateBuilder.observationRegistry()`** for RestTemplate, not manual interceptor wiring. Manual `ClientHttpRequestInterceptor` approaches do not propagate W3C `traceparent` headers correctly with Micrometer Tracing.
 7. **Never call `WebClient.builder().build()` in a Spring-managed class.** Creating a `TracingConfig @Bean` is not enough — any `@Service` or `@Component` that constructs its own `WebClient` directly will silently break cross-service trace propagation. Every such class must use an `@Autowired` constructor that accepts `WebClient.Builder`. The builder Spring injects is already instrumented with OTel; the one from `WebClient.builder()` is not.
-8. **One branch for all changes: `feature/ai-naive-tracing`** — create this branch before writing any code, one per repo.
+8. **One branch for all changes: `ai-single-prompt-tracing`** — create this branch before writing any code, one per repo.

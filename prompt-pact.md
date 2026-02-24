@@ -1,4 +1,4 @@
-# NAIVE PROMPT — PACT CONTRACT TESTING
+# PROMPT — PACT CONTRACT TESTING
 ## For use against: notification-service, order-service, payment-service, product-service, telemetry-service, user-service
 
 ---
@@ -49,6 +49,33 @@ The working directory contains six Spring Boot + Gradle microservices:
 - **Pact Storage**: Local file-based — pact JSON files stored in `<service>/build/pacts/` directories (Gradle default)
 - **Java**: 17+, **Spring Boot**: 3.x, **Build tool**: Gradle (Groovy DSL)
 - **Pact JVM version**: `au.com.dius.pact.consumer:junit5:4.6.x` (consumer) and `au.com.dius.pact.provider:junit5spring:4.6.x` (provider)
+
+---
+
+## STEP 0 — CREATE BRANCHES (DO THIS FIRST, BEFORE ANY OTHER ACTION)
+
+Before reading any file or writing any code, create the working branch in every existing repo:
+
+```bash
+# Run from the working directory root — one command per repo
+for svc in notification-service order-service payment-service product-service telemetry-service user-service; do
+    cd $svc
+    git checkout -b ai-single-prompt-pact
+    cd ..
+done
+```
+
+Verify all six branches exist before continuing:
+
+```bash
+for svc in notification-service order-service payment-service product-service telemetry-service user-service; do
+    echo -n "$svc: "
+    cd $svc && git branch --show-current && cd ..
+done
+# Expected output: ai-single-prompt-pact for every service
+```
+
+All code written from Step 1 onwards goes onto `ai-single-prompt-pact`. Never commit to `main`.
 
 ---
 
@@ -963,4 +990,4 @@ After pushing to the `main` branch:
 7. **Provider `@Provider` value = `spring.application.name`** — read the yml file to get this value; do not invent it.
 8. **`given()` strings and `@State` strings must match exactly** — copy-paste from consumer to provider; do not rephrase.
 9. **Pact files in build/ directory.** Pact files are written to `build/pacts/` and regenerated on each test run. They do not need to be committed to git.
-10. **One branch for all changes: `feature/ai-naive-pact`** — create this branch before writing any code, one per repo.
+10. **One branch for all changes: `ai-single-prompt-pact`** — create this branch before writing any code, one per repo.
