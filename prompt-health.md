@@ -66,6 +66,7 @@ For **each** of the six existing services, read and record:
 3. Every class that calls another service via `RestTemplate`, `WebClient`, `FeignClient`, or `RestClient` — list the service name and base URL so you can write a downstream health indicator for it
 4. Any `DataSource`, `JdbcTemplate`, `JpaRepository`, or database-related configuration — presence means the DB health indicator must be explicitly configured and verified
 5. Any other infrastructure dependencies: Redis, Kafka, RabbitMQ, external APIs, file system paths — each needs its own health indicator
+6. Any Spring Security configuration — look for classes annotated `@EnableWebSecurity` or beans returning `SecurityFilterChain`. If found, record it: the actuator endpoints will return **403** to unauthenticated callers (including downstream health indicators from other services) unless explicitly permitted. See Step 4f.
 
 Write a **health readiness map** in this exact format before touching any file:
 
@@ -129,12 +130,11 @@ gitProperties {
         'git.remote.origin.url',
         'git.tags'
     ]
-    // Write to the standard location Spring Boot expects
     dotGitDirectory = project.file("${project.rootDir}/.git")
-    generateGitPropertiesFile = true
-    generateGitPropertiesFilename = "${project.buildDir}/resources/main/git.properties"
 }
 ```
+
+**WARNING:** Do NOT add `generateGitPropertiesFile` or `generateGitPropertiesFilename` to this block — those properties do not exist in plugin version 2.4.1 and will cause the build to fail immediately with `Could not set unknown property`. The plugin writes to the correct location (`build/resources/main/git.properties`) by default without any extra configuration.
 
 ---
 
@@ -297,6 +297,20 @@ downstream:
 
 **IMPORTANT:** Use the actual `server.port` values you discovered in Step 1 for each service. Do not invent port numbers — read them from each service's `application.yml`.
 
+**Reuse existing config keys — do not duplicate.** Before adding a `downstream.*` key, check whether the service already configures that URL under a different property (e.g., `services.user-service.url`, `telemetry.service.url`). If an existing key already holds the correct URL, reference it directly in the `@Value` annotation:
+
+```java
+// ✅ Reuses existing config key — no duplication
+@Value("${services.user-service.url:http://localhost:8081}")
+private String userServiceUrl;
+
+// ❌ Adds a redundant key when services.user-service.url already exists
+@Value("${downstream.user-service.url:http://localhost:8081}")
+private String userServiceUrl;
+```
+
+Only add a new `downstream.*` key if no suitable URL property already exists in `application.yml`.
+
 ### 4c — Database health indicator (if applicable)
 
 If a service has a database and Spring Boot's auto-configured `DataSourceHealthIndicator` is active, no code is needed. Verify it is active by confirming `spring-boot-starter-data-jpa` or `spring-boot-starter-jdbc` is on the classpath.
@@ -342,14 +356,53 @@ management:
         # readiness: checks everything needed to serve real traffic
         # A readiness failure stops traffic routing but does NOT restart the pod
         readiness:
-          include: readinessState,db,downstream
+          include: readinessState,db,userService,productService   # replace with actual indicator IDs
           show-details: always
 ```
+
+**Use real indicator IDs — not placeholder names.** The `include` list must contain the actual Spring Boot health indicator IDs for each service. The ID is derived from the class name by removing the `HealthIndicator` suffix and lowercasing the first letter:
+
+| Class name | Health indicator ID |
+|---|---|
+| `UserServiceHealthIndicator` | `userService` |
+| `ProductServiceHealthIndicator` | `productService` |
+| `TelemetryServiceHealthIndicator` | `telemetryService` |
+| `NotificationServiceHealthIndicator` | `notificationService` |
+
+Using a name that does not match any registered indicator (e.g., `downstream`) silently excludes those checks — the readiness group will say UP even when all downstream services are down.
 
 This results in:
 - `GET /actuator/health/liveness` → used for Kubernetes liveness probes — never triggers restart due to DB outage
 - `GET /actuator/health/readiness` → used for Kubernetes readiness probes — stops traffic if DB or downstream is down
 - `GET /actuator/health` → full composite view, consumed by Spring Boot Admin
+
+### 4f — Spring Security and actuator access
+
+If Step 1 discovery found a `SecurityFilterChain` bean in the service, the actuator endpoints are blocked by default for unauthenticated requests. This means:
+- `GET /actuator/health` from another service's health indicator will receive **403**, not 200
+- The calling service's health indicator will catch the `HttpClientErrorException` and report `DOWN`
+- This is **not** the same as the service being unhealthy — it is a misconfiguration
+
+**The fix:** Add `/actuator/**` to the `permitAll()` matcher in the existing `SecurityFilterChain` bean. Do not create a new security config — modify the one that already exists:
+
+```java
+http
+    .authorizeHttpRequests(authz -> authz
+        .requestMatchers("/actuator/**").permitAll()   // ADD THIS LINE
+        .requestMatchers("/api/users/register", "/api/users/login").permitAll()
+        .anyRequest().authenticated()
+    )
+```
+
+**How to distinguish 403 from other failures** when a health indicator reports DOWN:
+
+| Error in health details | Root cause | Fix |
+|---|---|---|
+| `403 : [no body]` | Actuator present but blocked by Spring Security | Add `/actuator/**` to `permitAll()` |
+| `404 : {"path":"/actuator/health"}` | Actuator not installed | Add `spring-boot-starter-actuator` dependency |
+| `Connection refused` | Target service is not running | Start the service |
+
+This distinction matters: 403 and 404 require code changes; connection refused just means the service needs to be started.
 
 ### 4e — GOOD vs BAD health indicator patterns
 
@@ -750,6 +803,23 @@ done
 # 5. Click each service — confirm health details show db, downstream, diskSpace components
 # 6. Hit each service's health endpoint directly:
 curl -s http://localhost:<port>/actuator/health | python3 -m json.tool
+
+# Diagnosing DOWN components — check the "error" field in the health response:
+#
+#   "error": "403 : [no body]"
+#     → Actuator is present but Spring Security is blocking unauthenticated access.
+#       Fix: add .requestMatchers("/actuator/**").permitAll() to the SecurityFilterChain.
+#
+#   "error": "404 : {\"path\":\"/actuator/health\"}"
+#     → Actuator is not installed on the target service.
+#       Fix: add spring-boot-starter-actuator to that service's build.gradle.
+#
+#   "error": "... Connection refused"
+#     → The target service is not running.
+#       Fix: start the service.
+#
+# A service showing DOWN because one of its dependencies is not running is expected
+# and correct behaviour — it does not indicate a bug in the health indicator.
 ```
 
 ---
@@ -799,4 +869,5 @@ curl -s http://localhost:<port>/actuator/health | python3 -m json.tool
 7. **Do not use `management.endpoints.web.exposure.include: "*"`** in the six services — wildcard exposure is a security risk. Expose only `health,info,metrics,loggers`.
 8. **All changes go on `feature/ai-naive-health`** — this branch is created in Step 0 for the six existing repos, and after `git init` for `admin-service` in Step 5. Never commit to `main` in any repo. Verify the active branch before making any commit with `git branch --show-current`.
 9. **Check the actual `server.port` of each service from its `application.yml`** before writing downstream health indicator URLs — do not invent port numbers or assume defaults.
-10. **The `git-commit-id` plugin requires a `.git` directory** — each repo must be a git repository (which they are, since Step 0 checks out a branch). The plugin will fail with `dotGitDirectory does not exist` if run outside a git repo. Do not run `./gradlew build` from a path that does not have a `.git` ancestor.
+10. **If a service has Spring Security, `/actuator/**` must be explicitly permitted** — add `.requestMatchers("/actuator/**").permitAll()` to the existing `SecurityFilterChain` bean. Without this, all downstream health indicators that call this service will receive 403 and report DOWN, even when the service is fully healthy. See Step 4f.
+11. **The `git-commit-id` plugin requires a `.git` directory** — each repo must be a git repository (which they are, since Step 0 checks out a branch). The plugin will fail with `dotGitDirectory does not exist` if run outside a git repo. Do not run `./gradlew build` from a path that does not have a `.git` ancestor.
