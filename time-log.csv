@@ -1,8 +1,6 @@
 date,refactoring,approach,description,duration_mins,context_compactions,notes
-2006-2-21, pact, manual, DEPENDENCY ADDITIONS, 12, 0, Researched if providers with no pacts still pass
-2006-2-21, pact, manual, CONSUMER TESTS, 145, 0, 
-2006-2-22, pact, manual, PROVIDER TESTS,90, 0, 
-2006-2-23, health, manual, HEALTH ENDPOINTS,53, 0, 
-2006-2-23, tracing, manual, DISTRIBUTED TRACING,78, 0, 
+2006-2-21, pact, manual, ALL, 247, 0, 
+2006-2-23, health, manual, ALL,53, 0, 
+2006-2-23, tracing, manual, ALL,78, 0, 
 2006-2-23, health, one-step, ALL,13, 0,  This worked.  No need for a funnel approch for applying health endpoints to only 6 services.
-
+2006-2-23, tracing, one-step, ALL,43, 0,  This worked.  No need for a funnel approch for applying health endpoints to only 6 services.
