@@ -47,8 +47,16 @@ OBSERVABILITY READINESS MAP
   Existing micrometer/tracing deps: <list or NONE FOUND>
   Existing logging config file: <path or NONE FOUND>
   Outbound HTTP clients: <RestTemplate/WebClient/Feign or NONE>
+  Direct WebClient construction found: <list of classes using WebClient.builder().build() or NONE>
   Async methods: <list or NONE FOUND>
   @RestController endpoints: <list>
+
+CROSS-SERVICE TRACE CANDIDATE
+  Entry-point service: <the service whose controller triggers calls to the most downstream services>
+  Trigger endpoint: <HTTP method + path>
+  Sample request: <minimal curl command that exercises the cross-service path>
+  Expected downstream services: <list of service names that should appear in the Jaeger trace>
+  NOTE: If no single request crosses more than one service boundary, record "NONE — verification in Step 7 limited to single-service span export only"
 ```
 
 **Do not proceed to Step 2 until the readiness map is complete for all six services.**
@@ -297,6 +305,63 @@ grep "traceId" src/main/resources/application.yml
 > and run `./gradlew bootRun` again (which triggers `processResources`) for the new config to take effect.
 > Alternatively, copy the updated file to `build/resources/main/application.yml` before restarting.
 
+### Cross-service trace propagation verification
+
+Use the cross-service trace candidate identified in Step 1. If one exists, run the following after all services are up:
+
+```bash
+# Step A — send the trigger request (substitute the actual endpoint and payload from your readiness map)
+curl -s -X POST http://localhost:<port>/<path> \
+  -H "Content-Type: application/json" \
+  -d '<minimal payload>'
+
+# Step B — wait for OTel batch export (default interval is up to 5 seconds)
+sleep 5
+
+# Step C — query Jaeger API and verify spans cover multiple services
+curl -s "http://localhost:16686/api/traces?service=<entry-point-service-name>&limit=3&lookback=2m" | \
+python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+traces = data.get('data', [])
+if not traces:
+    print('FAIL: No traces found in Jaeger — check OTLP endpoint and service startup logs')
+    sys.exit(1)
+trace = traces[0]
+services = set()
+for span in trace.get('spans', []):
+    proc = trace.get('processes', {}).get(span.get('processID', ''), {})
+    svc = proc.get('serviceName', '')
+    if svc:
+        services.add(svc)
+span_count = len(trace.get('spans', []))
+print(f'Trace {trace[\"traceID\"][:16]}...: {span_count} spans across {len(services)} service(s)')
+print(f'Services in trace: {sorted(services)}')
+if len(services) < 2:
+    print('FAIL: Trace only covers 1 service — cross-service propagation is broken')
+    print('  Likely cause: a @Service or @Component constructs WebClient directly')
+    print('  Fix: grep -rn \"WebClient.builder().build()\" src/main/java/ in each service')
+    sys.exit(1)
+else:
+    print('PASS: Distributed trace spans multiple services correctly')
+"
+```
+
+**What a passing result looks like:**
+```
+Trace 2504ac6caf4ca840...: 35 spans across 5 service(s)
+Services in trace: ['notification-service', 'order-service', 'product-service', 'telemetry-service', 'user-service']
+PASS: Distributed trace spans multiple services correctly
+```
+
+**What a failing result looks like (and what it means):**
+```
+Trace ed2c59d8ed74a289...: 1 spans across 1 service(s)
+Services in trace: ['order-service']
+FAIL: Trace only covers 1 service — cross-service propagation is broken
+```
+A single-service trace despite a multi-service request means the outgoing HTTP calls are not carrying the `traceparent` header. The most common cause is a `@Service`/`@Component` constructing `WebClient` directly instead of injecting `WebClient.Builder`. Run `grep -rn "WebClient.builder().build()" src/main/java/` in each service and fix every match as described in Step 4.
+
 ### Consistency verification — run across all six service directories:
 
 ```bash
@@ -324,6 +389,7 @@ done
 - [ ] `./gradlew build` passes for all six services
 - [ ] Jaeger UI at `http://localhost:16686` shows traces from all six services after a request flow
 - [ ] A single trace in Jaeger shows connected spans from all services that participate in a given call chain
+- [ ] The Jaeger API verification script (Step 7) exits with PASS — the trace returned for the cross-service trigger request contains spans from more than one service (or documented as N/A if no cross-service call path exists in this codebase)
 - [ ] `traceId` is visible in log output for each service and matches the Jaeger trace ID
 - [ ] GitHub Actions workflows exist in every repository
 
@@ -338,4 +404,4 @@ done
 5. **Do not add a `logback-spring.xml`** if one does not already exist — use `logging.pattern.console` in `application.yml` instead.
 6. **Use `RestTemplateBuilder.observationRegistry()`** for RestTemplate, not manual interceptor wiring. Manual `ClientHttpRequestInterceptor` approaches do not propagate W3C `traceparent` headers correctly with Micrometer Tracing.
 7. **Never call `WebClient.builder().build()` in a Spring-managed class.** Creating a `TracingConfig @Bean` is not enough — any `@Service` or `@Component` that constructs its own `WebClient` directly will silently break cross-service trace propagation. Every such class must use an `@Autowired` constructor that accepts `WebClient.Builder`. The builder Spring injects is already instrumented with OTel; the one from `WebClient.builder()` is not.
-7. **One branch for all changes: `feature/ai-naive-tracing`** — create this branch before writing any code, one per repo.
+8. **One branch for all changes: `feature/ai-naive-tracing`** — create this branch before writing any code, one per repo.
