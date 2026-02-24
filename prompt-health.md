@@ -736,7 +736,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
-          distribution: 'temurin'
+          distribution: 'corretto'
       - name: Build and test
         run: ./gradlew build
       - name: Verify actuator health config is present
@@ -768,7 +768,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
-          distribution: 'temurin'
+          distribution: 'corretto'
       - name: Build admin-service
         run: |
           cd admin-service
