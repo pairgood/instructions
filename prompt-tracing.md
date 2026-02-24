@@ -97,7 +97,7 @@ management:
       probability: 1.0   # 100% sampling for demonstration — reduce to 0.1 in production
   otlp:
     tracing:
-      endpoint: http://localhost:4317  # Jaeger OTLP gRPC endpoint — SAME value in every service
+      endpoint: http://127.0.0.1:4318/v1/traces  # Jaeger OTLP HTTP endpoint — SAME value in every service
 
 spring:
   application:
@@ -110,9 +110,16 @@ logging:
 
 **Consistency rules — enforce across all six services:**
 - `management.tracing.sampling.probability` must be `1.0` in all six services
-- `management.otlp.tracing.endpoint` must be `http://localhost:4317` in all six services (identical string, no trailing slash)
+- `management.otlp.tracing.endpoint` must be `http://127.0.0.1:4318/v1/traces` in all six services (identical string)
 - `spring.application.name` values must NOT be modified — use whatever is already there
 - The log pattern's `[%X{traceId:-},%X{spanId:-}]` format must be identical in all six services
+
+> **Why `127.0.0.1` and port `4318`?**
+> Spring Boot's `management.otlp.tracing.endpoint` uses HTTP/protobuf transport (OkHttp), not gRPC.
+> Port 4317 is gRPC-only — sending HTTP to it causes "Broken pipe" errors and silent span loss.
+> Port 4318 is the OTLP HTTP port; the full path `/v1/traces` must be included.
+> Use `127.0.0.1` rather than `localhost` — on macOS, `localhost` resolves to IPv6 (`::1`) but
+> Jaeger binds IPv4 only, causing "Connection refused" errors.
 
 ---
 
@@ -256,6 +263,12 @@ grep "traceId" src/main/resources/application.yml
 # Verify: the trace shows spans from multiple services connected by the same traceId
 ```
 
+> **Gradle bootRun and config changes**: `./gradlew bootRun` serves `application.yml` from
+> `build/resources/main/`, not `src/main/resources/`. If you edit `src/main/resources/application.yml`
+> after starting the service, the running process does NOT see the change. You must stop the service
+> and run `./gradlew bootRun` again (which triggers `processResources`) for the new config to take effect.
+> Alternatively, copy the updated file to `build/resources/main/application.yml` before restarting.
+
 ### Consistency verification — run across all six service directories:
 
 ```bash
@@ -275,7 +288,7 @@ done
 ### Definition of Done
 
 - [ ] All six `application.yml` files contain `management.tracing.sampling.probability: 1.0`
-- [ ] All six `application.yml` files contain `management.otlp.tracing.endpoint: http://localhost:4317` (identical string)
+- [ ] All six `application.yml` files contain `management.otlp.tracing.endpoint: http://127.0.0.1:4318/v1/traces` (identical string)
 - [ ] All six `application.yml` files have the log pattern including `[%X{traceId:-},%X{spanId:-}]`
 - [ ] All six `build.gradle` files contain `micrometer-tracing-bridge-otel` and `opentelemetry-exporter-otlp`
 - [ ] Every service that makes outbound HTTP calls has a `@Bean` RestTemplate or WebClient wired with `ObservationRegistry`
@@ -290,7 +303,7 @@ done
 ## CRITICAL CONSTRAINTS
 
 1. **Do not change `spring.application.name`** in any service. These names are the service identity in Jaeger.
-2. **`management.otlp.tracing.endpoint` must be identical in all six services** — `http://localhost:4317` with no trailing slash, no variation.
+2. **`management.otlp.tracing.endpoint` must be identical in all six services** — `http://127.0.0.1:4318/v1/traces`, no variation.
 3. **`management.tracing.sampling.probability` must be `1.0` in all six services** — same value, no variation.
 4. **Do not modify any existing production logic.** Only add configuration, dependencies, and the `TracingConfig.java` class.
 5. **Do not add a `logback-spring.xml`** if one does not already exist — use `logging.pattern.console` in `application.yml` instead.
