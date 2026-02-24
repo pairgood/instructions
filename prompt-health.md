@@ -212,6 +212,22 @@ Spring Boot automatically activates these indicators when the corresponding depe
 - `PingHealthIndicator` — always active
 - `RedisHealthIndicator` — active when `spring-boot-starter-data-redis` is present
 - `RabbitHealthIndicator` — active when `spring-boot-starter-amqp` is present
+- `MailHealthIndicator` — active when `spring-boot-starter-mail` is present **AND** `spring.mail.host` is configured
+
+**WARNING — dependency on classpath ≠ health indicator registered.** Several auto-configured indicators are only created when the corresponding *bean* exists, which requires configuration properties to be set — not just the dependency. The most common trap:
+
+| Starter | Health indicator ID | Required config for bean to exist |
+|---|---|---|
+| `spring-boot-starter-mail` | `mail` | `spring.mail.host` must be set |
+| `spring-boot-starter-data-redis` | `redis` | `spring.data.redis.host` or equivalent must be set |
+| `spring-boot-starter-amqp` | `rabbit` | `spring.rabbitmq.host` must be set |
+
+If you add one of these IDs to a health group (`readiness.include: ...,mail,...`) without the corresponding bean being present, Spring Boot will **fail to start** with:
+```
+Included health contributor 'mail' in group 'readiness' does not exist
+```
+
+**Before adding any infrastructure indicator ID to a health group, verify the required config property is present in `application.yml`.** If it is not configured, do not include the indicator in any health group.
 
 For each service, confirm which built-in indicators will be active based on what you found in Step 1.
 
@@ -370,6 +386,8 @@ management:
 | `NotificationServiceHealthIndicator` | `notificationService` |
 
 Using a name that does not match any registered indicator (e.g., `downstream`) silently excludes those checks — the readiness group will say UP even when all downstream services are down.
+
+**A non-existent ID in a health group is NOT always silent.** Spring Boot validates group membership at startup and throws a fatal `NoSuchHealthContributorException` if any ID in the `include` list does not correspond to a registered contributor. This causes the application to refuse to start — it is not a runtime warning. Only include IDs for indicators that are guaranteed to be registered (see Step 4a for the conditions each requires).
 
 This results in:
 - `GET /actuator/health/liveness` → used for Kubernetes liveness probes — never triggers restart due to DB outage
