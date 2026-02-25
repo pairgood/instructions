@@ -789,17 +789,32 @@ done
 
 ---
 
-## STEP 7 — MIGRATION TO PACT BROKER (OPTIONAL — AFTER ALL TESTS PASS LOCALLY)
+## STEP 7 — BROKER INTEGRATION VIA GITHUB ACTIONS (PHASE 2 — AFTER ALL LOCAL TESTS ARE GREEN)
 
-**ONLY perform this step after all provider and consumer tests are passing locally using the local file-based workflow.**
+**CRITICAL: Do NOT begin this step until ALL provider and consumer tests are passing locally with file-based pacts (Steps 0–6 complete and every checklist item in Step 6 is green). This step is required — it is simply gated behind a fully green local test suite.**
 
-Once all pact tests are green, you can migrate to publishing pacts to a web-based Pact Broker via GitHub Actions. This provides a centralized contract registry and enables cross-repo contract verification.
+Once all pact tests are green locally, add a GitHub Actions workflow to **every one of the six service repos**. This is not optional; it is the production-ready final phase.
 
-### Why migrate to Pact Broker?
+### How broker integration works — broker calls the provider
+
+**Consumer side (publishes contracts):**
+- Consumer CI runs consumer tests → generates pact JSON → publishes pacts to the broker on each push to `main`
+
+**Provider side (called by the broker):**
+- The Pact Broker detects new or changed pacts and fires a **webhook** to the provider repo's GitHub Actions
+- **The provider CI is triggered BY THE BROKER**, not by the consumer's workflow
+- Provider CI fetches pacts from the broker, runs provider verification, and publishes results back to the broker
+
+**Each service repo gets its own independent workflow file:**
+- `pact-consumer.yml` — runs on push to `main`, publishes pacts to broker (only in services that consume other APIs)
+- `pact-provider.yml` — triggered by the broker webhook OR on push to `main`, verifies pacts from broker (only in services that provide APIs)
+
+### Why this approach?
 - Central source of truth for all contracts across services
 - Contract versioning and history
 - Can-I-Deploy checks for safe deployments
-- Works across CI/CD pipelines without needing local pact files
+- Provider verification triggered automatically when consumer contracts change, without coupling repo workflows
+- Works across independent CI/CD pipelines without shared local file systems
 
 ### Step 7.1 — Update Provider `build.gradle`
 
@@ -845,18 +860,22 @@ For each provider test class, replace `@PactFolder` with `@PactBroker`:
 **Add this:**
 ```java
 @Provider("product-service")
-@PactBroker(url = "${pactbroker.url:http://localhost:9292}", authentication = @PactBrokerAuth(scheme = "bearer", token = "${pactbroker.auth.token}"))
+@PactBroker(url = "${pactbroker.url}", authentication = @PactBrokerAuth(scheme = "bearer", token = "${pactbroker.auth.token}"))
 @IgnoreNoPactsToVerify
 ```
 
 The `${pactbroker.url}` and `${pactbroker.auth.token}` placeholders will be populated from environment variables in CI/CD.
 
-### Step 7.3 — Create GitHub Actions Workflow
+### Step 7.3 — Create GitHub Actions Workflows
 
-For **each** service, create `.github/workflows/pact.yml`:
+Each service repo gets **separate workflow files** for consumer publishing and provider verification. Do not combine them into one file — the provider workflow must be independently triggerable by the Pact Broker.
+
+#### Consumer workflow — for services that call other APIs
+
+Create `.github/workflows/pact-consumer.yml` in every service that **consumes** another service:
 
 ```yaml
-name: Pact Contract Tests
+name: Pact Consumer Tests
 
 on:
   push:
@@ -867,7 +886,6 @@ on:
 jobs:
   consumer-tests:
     runs-on: ubuntu-latest
-    # Only run consumer tests if this service HAS consumers (i.e., makes HTTP calls to other services)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -879,16 +897,31 @@ jobs:
         run: ./gradlew test --tests '*ConsumerPactTest'
 
       - name: Publish pacts to broker
-        if: github.ref == 'refs/heads/main'  # Only publish from main branch
+        if: github.ref == 'refs/heads/main'
         run: ./gradlew pactPublish
         env:
           PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
           PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+```
 
+#### Provider workflow — for services that expose APIs consumed by others
+
+Create `.github/workflows/pact-provider.yml` in every service that **provides** an API. This workflow must support `workflow_dispatch` so the Pact Broker can trigger it via webhook when consumer pacts change.
+
+```yaml
+name: Pact Provider Verification
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    # The Pact Broker fires a webhook that calls this workflow_dispatch endpoint.
+    # No inputs are required — the @PactBroker annotation fetches all relevant pacts
+    # from the broker automatically using the PACT_BROKER_BASE_URL secret.
+
+jobs:
   provider-verification:
     runs-on: ubuntu-latest
-    needs: consumer-tests  # Wait for consumer tests to publish pacts
-    # Only run provider tests if this service IS a provider (i.e., has REST endpoints called by others)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -896,20 +929,17 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Run provider verification tests
-        run: ./gradlew test --tests '*ProviderPactTest'
+      - name: Run provider verification against broker pacts
+        run: >
+          ./gradlew test --tests '*ProviderPactTest'
+          -Ppact.verifier.publishResults=true
+          -Ppact.provider.version=${{ github.sha }}
+          -Ppact.provider.branch=${{ github.ref_name }}
         env:
           PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
           PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
           pactbroker.url: ${{ secrets.PACT_BROKER_BASE_URL }}
           pactbroker.auth.token: ${{ secrets.PACT_BROKER_TOKEN }}
-
-      - name: Publish provider verification results
-        if: github.ref == 'refs/heads/main'
-        run: ./gradlew pactVerify -Ppact.verifier.publishResults=true -Ppact.provider.version=${{ github.sha }}
-        env:
-          PACT_BROKER_BASE_URL: ${{ secrets.PACT_BROKER_BASE_URL }}
-          PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
 
   can-i-deploy:
     runs-on: ubuntu-latest
@@ -929,9 +959,10 @@ jobs:
 ```
 
 **Important notes:**
-- Replace `<SERVICE_NAME>` with the actual `spring.application.name` value
-- Consumer-only services (e.g., services that call others but provide no APIs) can skip the `provider-verification` job
-- Provider-only services (e.g., services that provide APIs but call no others) can skip the `consumer-tests` job
+- Replace `<SERVICE_NAME>` in the `can-i-deploy` step with the actual `spring.application.name` value
+- Services that only consume (never provide) skip `pact-provider.yml`
+- Services that only provide (never consume) skip `pact-consumer.yml`
+- Services that both consume and provide (most services) need **both** workflow files
 
 ### Step 7.4 — Add Pact Publish Configuration
 
@@ -940,7 +971,7 @@ For **consumer** services, add the publish configuration to `build.gradle`:
 ```groovy
 pact {
     publish {
-        pactBrokerUrl = System.getenv('PACT_BROKER_BASE_URL') ?: 'http://localhost:9292'
+        pactBrokerUrl = System.getenv('PACT_BROKER_BASE_URL')
         pactBrokerToken = System.getenv('PACT_BROKER_TOKEN')
         tags = ['main']
         version = project.version ?: '1.0.0'
@@ -948,13 +979,39 @@ pact {
 }
 ```
 
-### Step 7.5 — Configure GitHub Secrets
+### Step 7.5 — Configure GitHub Secrets in Every Repo
 
-In each repository's GitHub settings, add the following secrets:
+In **each of the six** repositories' GitHub settings (`Settings → Secrets and variables → Actions`), add:
 - `PACT_BROKER_BASE_URL` — The URL of your Pact Broker (e.g., `https://your-org.pactflow.io`)
 - `PACT_BROKER_TOKEN` — The authentication token for your Pact Broker
 
-### Step 7.6 — Verification
+These secrets must be present in all six repos. Consumer repos need them to publish pacts; provider repos need them to fetch pacts from the broker and publish verification results.
+
+### Step 7.6 — Configure Pact Broker Webhooks (Enables Broker to Call Provider CI)
+
+For the broker to automatically trigger provider verification when a consumer publishes new or changed pacts, configure a webhook in the Pact Broker for **each provider service**.
+
+**What the webhook does**: When a consumer publishes a pact, the broker POSTs to the GitHub Actions `workflow_dispatch` API endpoint for the relevant provider repo, which triggers `pact-provider.yml`.
+
+**Webhook configuration (in PactFlow UI or API):**
+
+```
+Event: "Contract content changed" and "Contract published with changed content"
+Method: POST
+URL: https://api.github.com/repos/{org}/{provider-repo}/actions/workflows/pact-provider.yml/dispatches
+Headers:
+  Authorization: Bearer {GITHUB_PAT}
+  Accept: application/vnd.github.v3+json
+  Content-Type: application/json
+Body:
+  { "ref": "main" }
+```
+
+**Required GitHub PAT**: Create a GitHub Personal Access Token with the `workflow` scope. Store it in the Pact Broker as a secret (e.g., `GITHUB_WEBHOOK_TOKEN`) and reference it in the webhook `Authorization` header. This PAT must have access to trigger workflows in all provider repos.
+
+**One webhook per provider**: Each provider service (e.g., `product-service`, `user-service`) needs its own webhook entry in the broker, pointing to its own repo's workflow dispatch endpoint.
+
+### Step 7.7 — Verification
 
 After pushing to the `main` branch:
 
@@ -966,14 +1023,17 @@ After pushing to the `main` branch:
 
 ### Migration Checklist
 
-- [ ] All local provider and consumer tests passing with file-based pacts
+- [ ] All local provider and consumer tests passing with file-based pacts (every Step 6 checkbox green)
 - [ ] Provider `build.gradle` updated to use `fromPactBroker` instead of `pactFileLocation`
 - [ ] Provider test classes updated to use `@PactBroker` annotation instead of `@PactFolder`
 - [ ] Consumer `build.gradle` updated with `pact { publish { ... } }` configuration
-- [ ] `.github/workflows/pact.yml` created for each service
-- [ ] GitHub secrets `PACT_BROKER_BASE_URL` and `PACT_BROKER_TOKEN` configured in all repos
+- [ ] `.github/workflows/pact-consumer.yml` created in each service that consumes other APIs
+- [ ] `.github/workflows/pact-provider.yml` created (with `workflow_dispatch` trigger) in each service that provides APIs
+- [ ] GitHub secrets `PACT_BROKER_BASE_URL` and `PACT_BROKER_TOKEN` configured in **all six** repos
+- [ ] Pact Broker webhooks configured for each provider repo — broker fires `workflow_dispatch` to `pact-provider.yml` when consumer pacts change
+- [ ] GitHub PAT (with `workflow` scope) created and stored in Pact Broker for webhook authentication
 - [ ] Pushed to `main` branch and verified GitHub Actions workflows are green
-- [ ] Pact Broker UI shows all contracts published and verified
+- [ ] Pact Broker UI shows all pacts published, all provider verifications PASSED, and contract matrix green
 
 **Note:** After migration to the Pact Broker, the local `build/pacts/` directories are no longer used in CI/CD. They will still be generated during local test runs for development purposes.
 
