@@ -4,3 +4,4 @@ date,refactoring,approach,description,duration_mins,context_compactions,notes
 2006-2-23, tracing, manual, ALL,78, 0, 
 2006-2-23, health, one-step, ALL,13, 0,  This worked.  No need for a funnel approch for applying health endpoints to only 6 services.
 2006-2-23, tracing, one-step, ALL,43, 0,  This worked.  No need for a funnel approch for applying health endpoints to only 6 services.
+2006-2-21, pact, manual, ALL, 74, 0, This did completely fill the context window capacity but did not exceed it before completion.
